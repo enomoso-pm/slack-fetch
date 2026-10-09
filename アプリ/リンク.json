@@ -1,0 +1,8 @@
+{
+ "checked": "2026-10-09",
+ "slack_connector": "https://claude.ai/directory/597f662f-36de-437e-836e-5a81013cbfbe",
+ "my_connectors": "https://claude.ai/customize/connectors",
+ "org_connectors": "https://claude.ai/admin-settings/connectors",
+ "slack_admin": "https://slack.com/help/articles/54548358406419",
+ "help": "https://claude.com/docs/connectors/slack"
+}

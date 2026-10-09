@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>local.slack-fetch</string>
+	<key>CFBundleName</key><string>Slack取得</string>
+	<key>CFBundleDisplayName</key><string>Slack 取得</string>
+	<key>CFBundleExecutable</key><string>SlackFetch</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>0.1</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleDevelopmentRegion</key><string>ja</string>
+	<key>LSMinimumSystemVersion</key><string>14.0</string>
+	<key>LSUIElement</key><true/>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>NSHighResolutionCapable</key><true/>
+	<key>NSDownloadsFolderUsageDescription</key><string>取得の仕組みのフォルダにある記録を読み、毎朝の取得を動かすために使います。</string>
+	<key>NSDocumentsFolderUsageDescription</key><string>取得の仕組みのフォルダにある記録を読み、毎朝の取得を動かすために使います。</string>
+	<key>NSDesktopFolderUsageDescription</key><string>取得の仕組みのフォルダにある記録を読み、毎朝の取得を動かすために使います。</string>
+</dict>
+</plist>
