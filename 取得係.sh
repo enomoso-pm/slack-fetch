@@ -3,7 +3,7 @@
 #
 # 使い方（ターミナルで。毎朝の自動実行もこれを動かす）:
 #   bash 取得係.sh
-#       … 毎日の取得。データ/チャンネル.json の全チャンネルを、前回の続きから取る。
+#       … 毎日の取得。~/Slack取得データ/チャンネル.json の全チャンネルを、前回の続きから取る。
 #         直近2週間は取り直し（返信の増え・書き直し）、前回より後の返信を検索して古いスレッドも取り直す
 #   bash 取得係.sh <チャンネルID> <開始日> <終了日>
 #       … 1チャンネルの指定期間を取る（見直し・検索はしない。過去分をまとめて取るとき用）
@@ -15,7 +15,8 @@
 #      取得係にはファイルを読む道具もコマンドを打つ道具も渡さない（寄り道させない）
 #   3. slack.py extract が、置かれたファイルから原本を保存する
 #   一覧が空になるまで繰り返し、最後に記録を作って照合し、状態.json に結果を書いて通知する。
-#   取ったもの・設定・状態・取得ログは、すべて データ/ に置く（公開しないのはこのフォルダだけ）
+#   取ったもの・設定・状態・取得ログは、すべてホームの直下の Slack取得データ/ に置く（このフォルダの外。
+#   このフォルダは入れ替えたり公開したりするため）。場所は SLACK_FETCH_DATA で変えられる（試しのとき用）
 #
 # Claude Code の中（Claude 自身）からは動かせない（入れ子の起動は止められている）。自分のターミナルか、メニューバーのアプリから動かす。
 
@@ -29,11 +30,18 @@ COST_CAP="${COST_CAP:-5}"   # API換算の合計がこれ（ドル）を超え�
 # Slack の道具の名前の頭。claude.ai の Slack 連携なら mcp__claude_ai_Slack__（既定）。
 # 違うつなぎ方をしている人は、Claude Code で /mcp を開いて、Slack の道具の名前を確かめて書き換える
 SLACK_TOOLS="${SLACK_TOOLS:-mcp__claude_ai_Slack__}"
+# Slack の結果を AI に返さずファイルに置く大きさ（MAX_MCP_OUTPUT_TOKENS。トークン）。これを超えた結果はファイルに置かれ、
+# AI には置き場所だけが返る（2026-10 に Claude Code の説明書で確かめた。上限の値によらず同じ動き）。
+# 前は 100 で、投稿1つだけの短い週はその場で返って AI に見え、止まることがあった。20 なら投稿の入った結果はまずファイルに置かれる
+SPILL_TOKENS="${SPILL_TOKENS:-20}"
 CLAUDE_PROJECTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"   # Claude Code の作業記録の置き場所
+# bare（ログインも claude.ai の連携も使わない形。--bare と同じ）を、ほかの設定から受け継がない
+unset CLAUDE_CODE_SIMPLE
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SLACK_PY="$HERE/slack.py"
-DATA="$HERE/データ"
+DATA="${SLACK_FETCH_DATA:-$HOME/Slack取得データ}"   # slack.py・アプリと同じ決まり
+export SLACK_FETCH_DATA="$DATA"                      # slack.py にも同じ場所を使わせる
 LOG_DIR="$DATA/取得ログ/$(date +%Y-%m)"   # 取得ログは月ごと
 LOCK="$DATA/.取得中"
 PY=/usr/bin/python3
@@ -51,13 +59,18 @@ model_problem() {
   printf '%s\n' "$REPORT" | cat - "$ERRF" 2>/dev/null \
     | grep -qiE 'selected model|not_found_error|model_not_found|invalid model|model .{0,40}(does not exist|not found|not available|deprecated|retired)'
 }
+# ログインが使われなかったように見えるか。将来 claude -p の既定が bare（ログインも claude.ai の連携も使わない形）に
+# 変わると、こうなる（2026-10 の時点で、bare にしない指定は説明書に無い）
+BARE_HINT="Claude Code を新しくした直後なら、claude -p の動き方（bare。ログインも claude.ai の連携も使わない形）が変わったのかもしれない（README の「使う前に」）"
+login_problem() {
+  printf '%s\n' "$REPORT" | cat - "$ERRF" 2>/dev/null | grep -qiE 'api[ _-]?key|not logged in|log ?in|authenticat|oauth|credential'
+}
 
-# 前の形（このフォルダの一番上に 原本/・記録/・状態.json）のままなら、何も書かずに止まる。
-# 先に書くと、引っ越しのときに前の取得の記録が移らなくなるため
-if [ -d "$HERE/原本" ] || [ -d "$HERE/記録" ] || [ -f "$HERE/状態.json" ]; then
-  echo "前の形のデータ（このフォルダの一番上の 原本/・記録/・状態.json など）があります。"
-  echo "先に、このフォルダで python3 slack.py migrate を動かして データ/ に引っ越してから、もう一度動かしてください。"
-  notify "引っ越しが必要です" "このフォルダで python3 slack.py migrate を動かしてください"
+# 前の場所（このフォルダの中の データ/ や、一番上の 原本/・状態.json など）にデータが残っていれば、何も書かずに止まる。
+# 先に新しい場所に書くと、引っ越し先が空でなくなって引っ越せなくなるため
+if ! GUARD=$("$PY" "$SLACK_PY" guard); then
+  echo "$GUARD"
+  notify "引っ越しが必要です" "アプリの「引っ越す」を押すか、このフォルダで python3 slack.py migrate を動かしてください"
   exit 4
 fi
 mkdir -p "$LOG_DIR"
@@ -120,7 +133,7 @@ PRECHECK=""
 if ! command -v "${CLAUDE_BIN:-claude}" >/dev/null 2>&1; then
   PRECHECK="claude（Claude Code）が見つからない。Claude Code を入れるか、Cursor・VS Code に Claude Code の拡張機能を入れてログインしてから、もう一度動かす"
 elif [ "$MODE" = "毎日" ] && [ ${#JOBS[@]} -eq 0 ]; then
-  PRECHECK="取るチャンネルが無い。チャンネル.例.json を写して データ/チャンネル.json を作り、取りたいチャンネルを書く"
+  PRECHECK="取るチャンネルが無い。アプリの「はじめの準備」で選ぶか、チャンネル.例.json を写して ${DATA}/チャンネル.json を作り、取りたいチャンネルを書く"
 fi
 
 echo "取得を始めます（${MODE}・モデル ${MODEL}）" | tee -a "$SUMMARY"
@@ -184,7 +197,7 @@ $(cat "$PLAN")"
   OUT="$LOG_DIR/${STAMP}_round${ROUND}_結果.json"
   ERRF="$LOG_DIR/${STAMP}_round${ROUND}_エラー.txt"
   # 作業中のフォルダの CLAUDE.md などの決まりを読み込まないよう、/tmp で動かす
-  ( cd /tmp && MAX_MCP_OUTPUT_TOKENS=100 "${CLAUDE_BIN:-claude}" -p "$PROMPT" \
+  ( cd /tmp && MAX_MCP_OUTPUT_TOKENS="$SPILL_TOKENS" "${CLAUDE_BIN:-claude}" -p "$PROMPT" \
       --model "$MODEL" \
       --max-turns 60 \
       --allowedTools "ToolSearch,${SLACK_TOOLS}slack_read_channel,${SLACK_TOOLS}slack_read_thread,${SLACK_TOOLS}slack_search_public_and_private" \
@@ -214,6 +227,8 @@ $(cat "$PLAN")"
     RESULT="error"
     if grep -q "inside another Claude Code session" "$ERRF" 2>/dev/null; then
       NOTE="Claude Code の中から開いたアプリやターミナルでは取得係を動かせない。アプリを一度終了して、Finder か Spotlight から開き直す"
+    elif login_problem; then
+      NOTE="取得係が Claude のログインを使えなかった（ターミナルで claude を開いてログインを確かめる。${BARE_HINT}）: $(head -1 "$ERRF" 2>/dev/null)"
     else
       NOTE="取得係が動かなかった（ログインや通信を確かめる）: $(head -1 "$ERRF" 2>/dev/null)"
     fi
@@ -237,7 +252,7 @@ $(cat "$PLAN")"
   if [ "$SAVED" -eq 0 ]; then
     FAILS=$((FAILS + 1))
     if [ "$FAILS" -ge 2 ]; then
-      RESULT="error"; NOTE="取得係が2周続けて1件も取れなかった（Slack の道具が使えなかった。Slack 連携がつながっているか、道具の名前 ${SLACK_TOOLS}… が合っているかを確かめる）"
+      RESULT="error"; NOTE="取得係が2周続けて1件も取れなかった（Slack の道具が使えなかった。Slack 連携がつながっているか、道具の名前 ${SLACK_TOOLS}… が合っているかを確かめる。${BARE_HINT}）"
       echo "${NOTE}。ここで止めます。少し時間をおいて、もう一度動かしてください。" | tee -a "$SUMMARY"
       break
     fi

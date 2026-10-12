@@ -1,10 +1,10 @@
 // はじめの準備（① Slack をつなぐ → ② 取るチャンネルを選ぶ → ③ 取得を始める）
 //
 // - 2026-10-09: 準備が済んだあとも、チャンネルを足す・外す・呼び名や取り始める日を変えられるようにした（「Slack とチャンネル」の窓）
-// - 初めて開いたとき（データ/チャンネル.json が無いとき）に、状況ページの上に出す。設定とメニューからも開ける。
+// - 初めて開いたとき（Slack取得データ/チャンネル.json が無いとき）に、状況ページの上に出す。設定とメニューからも開ける。
 //   準備が済んでいれば、題は「Slack とチャンネル」で、チャンネルの画面から始まる
 // - 「つながったか確かめる」「Slack で探す」「取り始める日の推定」は、このアプリが チャンネル探し.sh を動かす
-//   （取得係と同じく、裏で Claude Code を動かす）。結果は データ/チャンネル候補.json に書かれ、ここで読む
+//   （取得係と同じく、裏で Claude Code を動かす）。結果は Slack取得データ/チャンネル候補.json に書かれ、ここで読む
 // - claude.ai のリンクは、build.sh がアプリに入れた links.json（もとは アプリ/リンク.json）から読む。
 //   リンクは変わることがあるので、変わったら リンク.json を直して組み立て直す
 
@@ -37,7 +37,7 @@ struct Links {
     }()
 }
 
-// MARK: - データ（データ/チャンネル候補.json・データ/チャンネル.json）
+// MARK: - データ（Slack取得データ/チャンネル候補.json・チャンネル.json）
 
 struct OldestInfo: Codable {
     var from: String?
@@ -89,7 +89,7 @@ struct ChannelConfig: Codable {
     var from: String
 }
 
-/// データ/外したチャンネル.json の1行。一覧から外したチャンネルの呼び名と取り始める日を覚えておき、付け直したときに戻す
+/// Slack取得データ/外したチャンネル.json の1行。一覧から外したチャンネルの呼び名と取り始める日を覚えておき、付け直したときに戻す
 /// （取ったデータは消さない。付け直せば、前に取った分を使い回して続きから取る）
 struct ShelvedChannel: Codable {
     var id: String
@@ -141,12 +141,12 @@ final class Setup: ObservableObject {
     @Published var removed: [String] = []
     /// 窓を開いたときに保存してあった一覧（✗ で外したものを戻す・変更を捨てるのに使う）
     @Published var savedAtOpen: [ChannelConfig] = []
-    /// 前に取っていたチャンネル（データ/外したチャンネル.json）と、保存したときに付け直したもの（③で伝える）
+    /// 前に取っていたチャンネル（外したチャンネル.json）と、保存したときに付け直したもの（③で伝える）
     @Published var shelved: [ShelvedChannel] = []
     @Published var reattached: [String] = []
     /// 保存したあとに呼ぶ（状況ページを数え直す。Store が決める）
     var onSaved: (() -> Void)?
-    var connectedAt: String?   // 最後に Slack とつながったのを確かめた時刻（データ/チャンネル候補.json）
+    var connectedAt: String?   // 最後に Slack とつながったのを確かめた時刻（チャンネル候補.json）
     private var lastStatus: FinderStatus?
     private var process: Process?
 
@@ -523,7 +523,7 @@ final class Setup: ObservableObject {
         return String(decoding: d, as: UTF8.self)
     }
 
-    /// データ/外したチャンネル.json に、1チャンネル1行で書く
+    /// Slack取得データ/外したチャンネル.json に、1チャンネル1行で書く
     static func writeShelved(_ list: [ShelvedChannel]) throws {
         let rows = list.map { s in
             "{\"id\": \(js(s.id)), \"tag\": \(js(s.tag)), \"name\": \(js(s.name)), \"from\": \(js(s.from)), "
@@ -533,7 +533,7 @@ final class Setup: ObservableObject {
         try text.write(to: Paths.shelved, atomically: true, encoding: .utf8)
     }
 
-    /// データ/チャンネル.json に、1チャンネル1行で書く（今の チャンネル.json と同じ形）
+    /// Slack取得データ/チャンネル.json に、1チャンネル1行で書く（今の チャンネル.json と同じ形）
     static func write(_ list: [Picked]) throws {
         let rows = list.map { p in
             "{\"id\": \(js(p.id)), \"tag\": \(js(p.tag.trimmingCharacters(in: .whitespaces))), "
@@ -760,6 +760,18 @@ struct ConnectStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            if setup.firstTime {
+                // 前の版（取ったデータを取得の仕組みのフォルダの中に置いていた）を使っていた人は、準備を進める前に引っ越す。
+                // 先に準備で新しい場所に書くと、引っ越し先が空でなくなって引っ越せないため。
+                // 前のフォルダをアプリが覚えていれば、ここに来る前に「引っ越す」が出る。覚えていないとき（前の版のアプリが古いなど）のため
+                Notice(kind: .info) {
+                    Text("前の版（2026年10月より前）を使っていた人は、準備を進める前に、取ったデータを引っ越してください").bold()
+                    Text("前の版は、取ったデータを取得の仕組みのフォルダの中に置いていました。前のフォルダを選ぶと、新しい場所（\(Paths.short(Paths.data.path))）へ写して、"
+                         + "1つずつ同じか確かめてから切り替えます（前のデータは消しません）。初めて使う人は、このまま下へ進んでください。")
+                    DadsButton(title: "前の版のフォルダを選んで引っ越す…", kind: .quiet, small: true) { AppDelegate.shared?.store.chooseOldData() }
+                        .padding(.top, 4)
+                }
+            }
             VStack(alignment: .leading, spacing: 6) {
                 Text(setup.firstTime ? "claude.ai で Slack をつなぐ" : "Slack のつなぎ方").font(.system(size: 16, weight: .bold)).foregroundStyle(Color.ink)
                 Text(setup.firstTime
@@ -1169,7 +1181,7 @@ struct StartStep: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(first ? "取得を始める" : "保存しました").font(.system(size: 16, weight: .bold)).foregroundStyle(Color.ink)
-                Text("\(setup.picked.count)チャンネルを データ/チャンネル.json に保存しました。")
+                Text("\(setup.picked.count)チャンネルを \(Paths.short(Paths.channels.path)) に保存しました。")
                     .font(.system(size: 13)).foregroundStyle(Color.ink2)
             }
             VStack(spacing: 0) {
@@ -1199,7 +1211,7 @@ struct StartStep: View {
                         Text("付け直したチャンネル（\(setup.reattached.joined(separator: "・"))）は、前に取った分を使い回して、\(nextFetch)で、外していた間と最近の分だけを取ります。外していた間が長いと、量が多めになります。")
                     }
                     if !setup.removed.isEmpty {
-                        Text("外したチャンネル（\(setup.removed.joined(separator: "・"))）の取ったデータは消えずに、データ/チャンネル/ に残ります。これからは取らず、状況ページの数にも入れません。あとで付け直せます。")
+                        Text("外したチャンネル（\(setup.removed.joined(separator: "・"))）の取ったデータは消えずに、\(Paths.short(Paths.data.path))/チャンネル/ に残ります。これからは取らず、状況ページの数にも入れません。あとで付け直せます。")
                     }
                     if setup.added.isEmpty && setup.reattached.isEmpty && setup.removed.isEmpty {
                         Text("取るチャンネルは変わっていません。呼び名や取り始める日を変えたときは、次の取得から効きます。")
@@ -1528,22 +1540,31 @@ enum SetupTest {
         Paths.defaults = MemoryStore()
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("slack-fetch-setup-test-\(ProcessInfo.processInfo.processIdentifier)")
+        Paths.dataOverride = root.appendingPathComponent(Paths.dataFolderName)   // 取ったデータの場所も一時フォルダの中
         defer { try? fm.removeItem(at: root) }
         var ng = 0
         func check(_ name: String, _ ok: Bool) { print((ok ? "OK  " : "NG  ") + name); if !ok { ng += 1 } }
         func text(_ u: URL) -> String { (try? String(contentsOf: u, encoding: .utf8)) ?? "" }
         do {
-            try fm.createDirectory(at: root.appendingPathComponent("データ"), withIntermediateDirectories: true)
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
             for f in Paths.required { fm.createFile(atPath: root.appendingPathComponent(f).path, contents: Data()) }
             Paths.current = root
             check("一時フォルダを使っている（本物のデータではない）", Paths.channels.path.hasPrefix(root.path))
-            // 前の形のデータ（フォルダの一番上に 状態.json）があるあいだは「引っ越しが要る」。データ/ に移せば要らなくなる
-            check("前の形のデータが無ければ、引っ越しは要らない", !Store.needsMigrate)
+            // 前の場所（取得の仕組みのフォルダの中）にデータがあるあいだは「引っ越しが要る」。引っ越し済みの名前になれば要らない
+            check("前の場所にデータが無ければ、引っ越しは要らない", !Store.needsMigrate)
+            let inner = root.appendingPathComponent("データ")
+            try fm.createDirectory(at: inner, withIntermediateDirectories: true)
+            fm.createFile(atPath: inner.appendingPathComponent("チャンネル.json").path, contents: Data("[]\n".utf8))
+            check("取得の仕組みのフォルダの中の データ/ にデータがあれば、引っ越しが要る（はじめの準備を勝手に開かず、数え直さない）",
+                  Store.needsMigrate)
+            check("…そのあいだは、新しい場所に記録を書かない（引っ越し先が空でなくなるため）",
+                  Store.appLog("試し") == nil && !fm.fileExists(atPath: Paths.data.path))
+            try fm.moveItem(at: inner, to: root.appendingPathComponent("データ（引っ越し済み 2026-10-13）"))
+            check("引っ越し済みの名前になれば、引っ越しは要らない", !Store.needsMigrate)
             fm.createFile(atPath: root.appendingPathComponent("状態.json").path, contents: Data("{}".utf8))
-            check("一番上に 状態.json があれば、引っ越しが要る（はじめの準備を勝手に開かず、数え直さない）", Store.needsMigrate)
-            try fm.moveItem(at: root.appendingPathComponent("状態.json"), to: Paths.state)
-            check("データ/ に移せば、引っ越しは要らない", !Store.needsMigrate)
-            try fm.removeItem(at: Paths.state)
+            check("一番上に 状態.json があれば（もっと前の形）、引っ越しが要る", Store.needsMigrate)
+            try fm.removeItem(at: root.appendingPathComponent("状態.json"))
+            try fm.createDirectory(at: Paths.data, withIntermediateDirectories: true)
             // 今の チャンネル.json と同じ形の、架空の3チャンネル
             let original = "[\n {\"id\": \"C0TEST0001\", \"tag\": \"本\", \"name\": \"#テスト_本\", \"from\": \"2024-12-27\"},\n"
                 + " {\"id\": \"C0TEST0002\", \"tag\": \"開発\", \"name\": \"#テスト_開発\", \"from\": \"2025-02-20\"},\n"

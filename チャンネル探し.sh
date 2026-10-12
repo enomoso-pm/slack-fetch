@@ -5,7 +5,7 @@
 #   bash チャンネル探し.sh --check             … Slack がつながったかを確かめる（ついでに、チャンネルの候補を少し探す）
 #   bash チャンネル探し.sh --search <言葉>     … チャンネルを名前で探す
 #   bash チャンネル探し.sh --oldest <ID ...>   … できた日が分からないチャンネルの、いちばん古い投稿の月を探す（できた日の推定）
-# 結果は データ/チャンネル候補.json に書く（アプリが読む）。ログは データ/取得ログ/<年-月>/ に置く。
+# 結果は ~/Slack取得データ/チャンネル候補.json に書く（アプリが読む）。ログは ~/Slack取得データ/取得ログ/<年-月>/ に置く。
 #
 # 取得係と同じく、Claude Code（Haiku）を裏で動かして Slack の道具を呼ばせる。ただし:
 # - チャンネルを探すときは、チャンネルの名前・説明を AI が読んで一覧（JSON）にまとめる（投稿は読まない）。
@@ -21,13 +21,22 @@ export PATH="$HOME/.local/bin:$HOME/.claude/local:/usr/local/bin:/opt/homebrew/b
 MODEL="${MODEL:-haiku}"
 # Slack の道具の名前の頭（取得係.sh と同じ。違うつなぎ方をしている人は書き換える）
 SLACK_TOOLS="${SLACK_TOOLS:-mcp__claude_ai_Slack__}"
+SPILL_TOKENS="${SPILL_TOKENS:-20}"   # 結果をファイルに置く大きさ（取得係.sh と同じ。できた日の推定で使う）
 CLAUDE_PROJECTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"   # Claude Code の作業記録の置き場所
+unset CLAUDE_CODE_SIMPLE   # bare（ログインも claude.ai の連携も使わない形）を、ほかの設定から受け継がない（取得係.sh と同じ）
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SLACK_PY="$HERE/slack.py"
-LOG_DIR="$HERE/データ/取得ログ/$(date +%Y-%m)"   # 取得係と同じく、取得ログは月ごと
-mkdir -p "$LOG_DIR"
+DATA="${SLACK_FETCH_DATA:-$HOME/Slack取得データ}"   # slack.py・アプリ・取得係と同じ決まり
+export SLACK_FETCH_DATA="$DATA"
+LOG_DIR="$DATA/取得ログ/$(date +%Y-%m)"   # 取得係と同じく、取得ログは月ごと
 PY=/usr/bin/python3
+# 前の場所にデータが残っていれば、何も書かずに止まる（取得係.sh と同じ）
+if ! GUARD=$("$PY" "$SLACK_PY" guard); then
+  echo "$GUARD"
+  exit 4
+fi
+mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 # 取得係（/tmp で動かす）の作業記録と混ざらないよう、別のフォルダで動かす（ここにも CLAUDE.md は置かない）
 WORK=/tmp/slack-fetch-channels
@@ -46,7 +55,7 @@ if [ -z "$MODE" ] || { [ "$MODE" = search ] && [ -z "$QUERY" ]; } || { [ "$MODE"
   exit 2
 fi
 
-# うまくいかなかった理由を データ/チャンネル候補.json に書いて終わる（アプリに出る）
+# うまくいかなかった理由を チャンネル候補.json に書いて終わる（アプリに出る）
 fail() {
   if [ "$MODE" = oldest ]; then
     "$PY" "$SLACK_PY" oldest done "${IDS[@]}" --fail "$1" >/dev/null
@@ -94,6 +103,10 @@ run_claude() {
   if [ -z "$SESSION" ] || [ -z "$LOG" ]; then
     if grep -q "inside another Claude Code session" "$ERRF" 2>/dev/null; then
       fail "Claude Code の中から開いたアプリやターミナルでは動かせない。アプリを一度終了して、Finder か Spotlight から開き直す"
+    fi
+    # ログインが使われなかったように見えるとき（将来 claude -p の既定が bare に変わると、こうなる。取得係.sh と同じ）
+    if printf '%s\n' "$REPORT" | cat - "$ERRF" 2>/dev/null | grep -qiE 'api[ _-]?key|not logged in|log ?in|authenticat|oauth|credential'; then
+      fail "Claude のログインを使えなかった（ターミナルで claude を開いてログインを確かめる。Claude Code を新しくした直後なら、claude -p の動き方〈bare〉が変わったのかもしれない）: $(head -1 "$ERRF" 2>/dev/null)"
     fi
     fail "Claude Code が動かなかった（ログインや通信を確かめる）: $(head -1 "$ERRF" 2>/dev/null)"
   fi
@@ -146,7 +159,7 @@ for ROUND in 1 2 3 4; do
 Calls (one JSON per line; \"tool\" is the tool name, \"args\" are the arguments):
 ${PLAN}"
   # 投稿の中身を AI に見せないよう、結果は毎回ファイルに逃がす（取得係と同じ）
-  run_claude "$PROMPT" "${SLACK_TOOLS}slack_search_public_and_private" 100
+  run_claude "$PROMPT" "${SLACK_TOOLS}slack_search_public_and_private" "$SPILL_TOKENS"
   READ="$("$PY" "$SLACK_PY" oldest read "$LOG")"
   echo "$READ"
   # 投稿が AI に見えたかは、AI の言葉ではなく作業記録で確かめる（確かめた分は上で書いたので、押し直せば続きから）

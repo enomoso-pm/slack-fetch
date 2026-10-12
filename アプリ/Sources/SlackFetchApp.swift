@@ -1,14 +1,18 @@
 // Slack 取得（メニューバーのアプリ）
 //
-// - 状態は、取得の仕組みのフォルダ（取得係.sh のある場所）の データ/状態.json と データ/取得の記録.jsonl を読んで出す
-//   （取得係.sh と slack.py が書く）。フォルダは build.sh が組み立てるときにアプリに書き込む。設定で変えられる
+// - 状態は、取ったデータのフォルダ（ホームの直下の Slack取得データ/）の 状態.json と 取得の記録.jsonl を読んで出す
+//   （取得係.sh と slack.py が書く）。データのフォルダは、取得の仕組みのフォルダ（取得係.sh のある場所。GitHub から
+//   取ってきて入れ替えたり公開したりする）の外に置く。決まりは台本と同じ（SLACK_FETCH_DATA があればそこ）
+// - 取得の仕組みのフォルダは build.sh が組み立てるときにアプリに書き込む。設定で変えられる。
+//   前の版のように、このフォルダの中（データ/ や一番上）にデータが残っていれば、「引っ越す」で新しい場所へ移す
 // - 「今すぐ取る」と毎朝の自動実行は、このアプリが 取得係.sh を動かす。
 //   Mac は「書類」「ダウンロード」「デスクトップ」のフォルダを守っていて、予約の仕組み（launchd）から動いた台本は
 //   中のファイルに触れない。このアプリに許可をもらえば、アプリから動かした台本は触れる。そのためアプリが受け持つ
-// - 取得の仕組みのフォルダは、場所の文字ではなくフォルダそのもの（Mac のブックマーク）でも覚える。
-//   同じディスクの中で動かしても追いかけて知らせる。見つからないときはアラートを出し、選び直してもらう
+// - 取得の仕組みのフォルダは、場所の文字と、フォルダそのもの（Mac のブックマーク）の両方で覚える。
+//   別の場所で組み立て直したら、そちら（新しい版）を使う。同じ場所に新しい版を置いたら、古いほうを名前を変えて残していても
+//   新しい版を使う。元の場所が空のときだけ、動かしたフォルダを追いかけて知らせる。見つからないときはアラートで選び直してもらう
 // - はじめの準備（Slack をつなぐ → チャンネルを選ぶ → 取得を始める）は Setup.swift。
-//   メニューの「Slack とチャンネル…」と設定から開き、取るチャンネルを足す・外す。データ/チャンネル.json が無いときは開いたときに出す。
+//   メニューの「Slack とチャンネル…」と設定から開き、取るチャンネルを足す・外す。Slack取得データ/チャンネル.json が無いときは開いたときに出す。
 //   準備の窓を開いている間と、最初の取得の前は、毎朝の自動取得を動かさない
 // - 取得に使うモデルは設定で選ぶ（台本に MODEL として渡す）
 // - 確認用: SlackFetch --snapshot <フォルダ> で、各状態のメニューと状況ページを画像に書き出して終わる
@@ -107,28 +111,87 @@ enum Paths {
         }
     }
 
-    /// フォルダを探す。1. 覚えておいたフォルダ（ブックマーク。同じディスクの中なら、動かしても名前を変えても追いかけられる）
-    /// 2. 設定で選んだ場所 3. 組み立てたときの場所 4. アプリの置き場所から3つ上
-    static func resolve(save: Bool = true, builtIn: Bool = true) -> Outcome {
+    /// フォルダを探す。データはフォルダの外にあるので、探すのは台本（取得係.sh・slack.py）の場所だけ。
+    /// 1. 組み立て直した場所（前と違う場所で組み立て直したら、新しい版としてそちらを使い、前の場所を覚えておく〈前のデータを探すため〉）
+    /// 2. 覚えている場所の文字（古いフォルダの名前を変えて残し、新しい版を同じ場所に置いたときも、新しい版を使う）
+    /// 3. 覚えておいたフォルダそのもの（ブックマーク。元の場所が空のときだけ。同じディスクの中なら、動かしても名前を変えても追いかける）
+    /// 4. 組み立てたときの場所 5. アプリの置き場所から3つ上
+    static func resolve(save: Bool = true, builtIn: Bool = true, built: URL? = builtDir) -> Outcome {
         let last = defaults.string(forKey: "baseDir")
         var found: URL?
-        if let data = defaults.data(forKey: "baseBookmark") {
+        var rebuilt = false
+        if builtIn, let u = built, looksRight(u), defaults.string(forKey: "builtDirSeen") != u.path {
+            found = u
+            rebuilt = true
+        }
+        if found == nil, let last, !last.isEmpty, looksRight(URL(fileURLWithPath: last)) { found = URL(fileURLWithPath: last) }
+        if found == nil, let data = defaults.data(forKey: "baseBookmark") {
             var stale = false
             if let u = try? URL(resolvingBookmarkData: data, options: [.withoutUI, .withoutMounting],
                                 relativeTo: nil, bookmarkDataIsStale: &stale), looksRight(u) {
                 found = u
             }
         }
-        if found == nil, let last, !last.isEmpty, looksRight(URL(fileURLWithPath: last)) { found = URL(fileURLWithPath: last) }
-        if found == nil, builtIn, let u = builtDir, looksRight(u) { found = u }
+        if found == nil, builtIn, let u = built, looksRight(u) { found = u }
         if found == nil, builtIn, looksRight(nearApp) { found = nearApp }
-        guard let u = found else { return .missing(last: last ?? builtDir?.path ?? nearApp.path) }
-        if save { remember(u) }
-        if let last, !last.isEmpty,
-           URL(fileURLWithPath: last).resolvingSymlinksInPath().path != u.resolvingSymlinksInPath().path {
-            return .moved(from: last, to: u)
+        guard let u = found else { return .missing(last: last ?? built?.path ?? nearApp.path) }
+        let changed = last.map { !$0.isEmpty && !samePath(URL(fileURLWithPath: $0), u) } ?? false
+        if save {
+            if rebuilt, changed, let last { defaults.set(last, forKey: "previousBaseDir") }
+            if builtIn, let b = built { defaults.set(b.path, forKey: "builtDirSeen") }
+            remember(u)
         }
+        // 組み立て直して新しい版に移ったときは知らせない（自分で組み立てたので）。前の場所にデータがあれば、引っ越しを案内する
+        if changed, !rebuilt, let last { return .moved(from: last, to: u) }
         return .same(u)
+    }
+
+    /// 同じ場所か（日本語の名前は、濁点の持ち方〈NFC・NFD〉が違っても同じとみなす）
+    static func samePath(_ a: URL, _ b: URL) -> Bool {
+        let n = { (u: URL) in u.standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping }
+        return n(a) == n(b)
+    }
+
+    /// 前に使っていた取得の仕組みのフォルダ（別の場所で組み立て直したときに覚える。前のデータを探すため）
+    static var previousBase: URL? {
+        guard let s = defaults.string(forKey: "previousBaseDir"), !s.isEmpty else { return nil }
+        return URL(fileURLWithPath: s)
+    }
+
+    // ---- 前の場所のデータ（引っ越し） ----
+
+    /// もっと前の形で、フォルダの一番上にあったもの（slack.py の OLD_TOP と同じ）
+    static let oldTop = ["原本", "記録", "取得ログ", "チャンネル.json", "外したチャンネル.json", "チャンネル候補.json",
+                         "状態.json", "取得の記録.jsonl", "例外.json"]
+    /// 引っ越したあと、前のデータに付ける名前の頭（slack.py の MOVED_PREFIX と同じ）
+    static let movedPrefix = "データ（引っ越し済み"
+
+    /// そのフォルダに前のデータが残っているか（slack.py の old_data_kinds と同じ決まり）
+    static func hasOldData(_ folder: URL) -> Bool {
+        let fm = FileManager.default
+        if samePath(folder, data) { return false }   // データの場所を、わざとこのフォルダにしている
+        let inner = folder.appendingPathComponent("データ")
+        if !samePath(inner, data), let items = try? fm.contentsOfDirectory(atPath: inner.path),
+           items.contains(where: { $0 != ".DS_Store" }) {
+            return true
+        }
+        return oldTop.contains { fm.fileExists(atPath: folder.appendingPathComponent($0).path) }
+    }
+
+    /// 前のデータが残っているフォルダ（今のフォルダか、前に使っていたフォルダ）。引っ越すまで、取得・数え直し・はじめの準備はしない
+    static var oldDataFolder: URL? {
+        ([base] + (previousBase.map { [$0] } ?? [])).first { hasOldData($0) }
+    }
+
+    /// 引っ越したあとに残してある前のデータ（新しい場所で取得できたのを確かめてから、設定でゴミ箱に入れる）
+    static var movedLeftovers: [URL] {
+        var folders = [base]
+        if let p = previousBase, !samePath(p, base) { folders.append(p) }
+        return folders.flatMap { folder in
+            ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+                .filter { $0.precomposedStringWithCanonicalMapping.hasPrefix(movedPrefix) }.sorted()
+                .map { folder.appendingPathComponent($0) }
+        }
     }
 
     /// 場所を覚える（場所の文字と、フォルダそのもの〈ブックマーク〉の両方）
@@ -152,8 +215,20 @@ enum Paths {
     }
 
     static func short(_ p: String) -> String { (p as NSString).abbreviatingWithTildeInPath }
-    /// 取ったもの・設定・状態の置き場所（公開しないのはこのフォルダだけ）
-    static var data: URL { base.appendingPathComponent("データ") }
+
+    /// 取ったもの・設定・状態の置き場所。取得の仕組みのフォルダの外（入れ替えても消えず、公開リポジトリにも入らない）。
+    /// 決まりは台本・slack.py と同じ: SLACK_FETCH_DATA があればそこ、無ければホームの直下の Slack取得データ
+    static let dataFolderName = "Slack取得データ"
+    /// 確かめ用（自己試験と、確認用の画像の -dataDir）。本物の設定とデータに触らないため
+    static var dataOverride: URL?
+    private static let argumentDataDir = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["dataDir"] as? String
+    static var data: URL {
+        if let dataOverride { return dataOverride }
+        for s in [argumentDataDir, ProcessInfo.processInfo.environment["SLACK_FETCH_DATA"]] {
+            if let s, !s.isEmpty { return URL(fileURLWithPath: (s as NSString).expandingTildeInPath) }
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(dataFolderName)
+    }
     static var state: URL { data.appendingPathComponent("状態.json") }
     static var history: URL { data.appendingPathComponent("取得の記録.jsonl") }
     static var script: URL { base.appendingPathComponent("取得係.sh") }
@@ -329,12 +404,16 @@ final class Store: ObservableObject {
     }
 
     @Published var showSettings = false
-    @Published var configured = false   // データ/チャンネル.json に取るチャンネルがあるか（はじめの準備が済んだか）
+    @Published var configured = false   // Slack取得データ/チャンネル.json に取るチャンネルがあるか（はじめの準備が済んだか）
     let setup = Setup()
     /// 状況ページの数え直し（slack.py status refresh）をしている間
     @Published var refreshing = false
     @Published var baseMissing = false
     @Published var basePath = ""
+    /// 前の場所から新しい場所へ引っ越している間（slack.py migrate）
+    @Published var migrating = false
+    /// 引っ越したあとに残してある前のデータ（設定でゴミ箱に入れられる）
+    @Published var leftovers: [URL] = []
     private var lastMissingAlert: String?
     var forced: DisplayState?   // 確認用の画像を作るときだけ使う
     var previewTip: String?
@@ -400,29 +479,28 @@ final class Store: ObservableObject {
     static let noScriptMessage = "取得の仕組みのフォルダに 取得係.sh が見つかりません。設定（歯車）でフォルダを選んでください。"
     /// まだ一度も取っていないときの案内（はじめの準備が済んだかで変わる）
     var freshText: String {
-        if Store.needsMigrate { return "前の形のデータがあります。先に データ/ に引っ越してください（やり方は下の赤い文）" }
+        if Store.needsMigrate { return "前の場所にデータがあります。「引っ越す」を押して、新しい場所（\(Paths.short(Paths.data.path))）へ移してください" }
         return configured
             ? "準備ができました。「今すぐ取る」を押すと、取り始める日からの分をまとめて取ります（多いときは何回かに分けて）"
             : "はじめの準備（Slack をつなぐ・取るチャンネルを選ぶ）をしてください。終わったら、取り始める日からの分をまとめて取ります"
     }
 
-    static let migrateMessage = "前の形のデータ（このフォルダの一番上の 原本/・状態.json など）があります。"
-        + "ターミナルでこのフォルダに入り、python3 slack.py migrate を動かして データ/ に引っ越してください。"
-
-    /// 前の形のまま（状態.json がフォルダの一番上にあり、データ/ には無い）。引っ越すまでは、はじめの準備を勝手に開かず、
-    /// 数え直しもしない（先に データ/状態.json ができると、引っ越しで前の 状態.json が移らず、取得係.sh が止まったままになる）
-    static var needsMigrate: Bool {
-        let fm = FileManager.default
-        return fm.fileExists(atPath: Paths.base.appendingPathComponent("状態.json").path) && !fm.fileExists(atPath: Paths.state.path)
+    static let migrateMessageHead = "前の場所（"
+    static var migrateMessage: String {
+        migrateMessageHead + Paths.short((Paths.oldDataFolder ?? Paths.base).path) + "）にデータがあります。"
+            + "「引っ越す」を押すと、新しい場所（\(Paths.short(Paths.data.path))）へ写して、1つずつ同じか確かめてから切り替えます。"
+            + "前のデータは消しません。"
     }
 
+    /// 前の場所（取得の仕組みのフォルダの中の データ/ や一番上）にデータが残っている。引っ越すまでは、はじめの準備を勝手に開かず、
+    /// 取得も数え直しもしない（先に新しい場所に書くと、引っ越し先が空でなくなって引っ越せなくなる）
+    static var needsMigrate: Bool { Paths.oldDataFolder != nil }
+
     func load() {
-        // 前の形のまま（状態.json がフォルダの一番上にある）なら、引っ越しを案内する
-        if Store.needsMigrate {
-            message = Store.migrateMessage
-        } else if message == Store.migrateMessage {
-            message = nil
-        }
+        // 前の場所にデータが残っているときの案内は、赤い文（失敗の知らせ）ではなく、状況ページの上の知らせと
+        // メニューの案内に出す（「引っ越す」のボタンの近く）
+        if message?.hasPrefix(Store.migrateMessageHead) == true { message = nil }
+        leftovers = Paths.movedLeftovers
         do {
             let data = try Data(contentsOf: Paths.state)
             if let f = try? JSONDecoder().decode(StateFile.self, from: data) { file = f }
@@ -610,7 +688,8 @@ final class Store: ObservableObject {
 
     func checkSchedule() {
         // はじめの準備が済み、最初の取得を自分で始めてから動く。準備の窓を開いている間も待つ（チャンネルを選び直している途中に始めない）
-        guard autoEnabled, !running, !baseMissing, forced == nil, configured, !history.isEmpty, !setup.show else { return }
+        guard autoEnabled, !running, !migrating, !baseMissing, forced == nil, configured, !history.isEmpty, !setup.show,
+              !Store.needsMigrate else { return }
         let t = todaySchedule
         guard now >= t else { return }
         if let s = lastRunStart, s >= t { return }
@@ -631,6 +710,7 @@ final class Store: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         env["PATH"] = "\(home)/.local/bin:\(home)/.claude/local:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
         env["MODEL"] = currentModel
+        env["SLACK_FETCH_DATA"] = Paths.data.path   // 台本・slack.py にも、アプリと同じデータの場所を使わせる
         return env
     }
 
@@ -663,6 +743,7 @@ final class Store: ObservableObject {
     /// 「必ず後ろに足す」形（O_APPEND）で開く。取得と数え直し・チャンネル探しなど2つが同時に書いても、
     /// 開いたときの場所に書いて相手を上書きすることがない（2026-10-09 16:28 に、数え直しが取得の見出しを上書きした）
     static func appLog(_ title: String) -> FileHandle? {
+        guard !needsMigrate else { return nil }   // 前のデータが残っているうちは、新しい場所に書かない（引っ越し先が空でなくなる）
         let logURL = Paths.logs.appendingPathComponent("アプリから動かした記録.log")
         try? FileManager.default.createDirectory(at: Paths.logs, withIntermediateDirectories: true)
         let fd = open(logURL.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
@@ -673,7 +754,7 @@ final class Store: ObservableObject {
     }
 
     func runNow() {
-        guard !running else { return }
+        guard !running, !migrating else { return }
         if launchedFromClaudeCode {
             message = Store.reopenMessage
             return
@@ -683,8 +764,8 @@ final class Store: ObservableObject {
             message = Store.noScriptMessage
             return
         }
-        if Store.needsMigrate {   // 前の形のデータのままなら、はじめの準備ではなく引っ越しを案内する（取得係.sh も動かない）
-            message = Store.migrateMessage
+        if Store.needsMigrate {   // 前の場所にデータがあれば、取る前に引っ越し（取得係.sh も動かない）
+            migrate()
             return
         }
         configured = !Setup.savedChannels().isEmpty   // はじめの準備で保存した直後でも、ここで読み直す
@@ -726,9 +807,9 @@ final class Store: ObservableObject {
     }
 
     /// 状況ページの数字を数え直す（slack.py status refresh。取得の記録は増えない・Claude は動かさない。20秒ほど）。
-    /// 数えるのは一覧（データ/チャンネル.json）にあるチャンネルだけ。取得中は数え直さない（取得の終わりに、新しい一覧で数え直される）
+    /// 数えるのは一覧（チャンネル.json）にあるチャンネルだけ。取得中は数え直さない（取得の終わりに、新しい一覧で数え直される）
     func refreshStatus() {
-        guard !running, !baseMissing, !Store.needsMigrate else { return }
+        guard !running, !migrating, !baseMissing, !Store.needsMigrate else { return }
         if refreshProcess != nil {   // 数え直しの途中なら、終わってからもう一度
             refreshAgain = true
             return
@@ -765,7 +846,116 @@ final class Store: ObservableObject {
         }
     }
 
-    // ---- 既知の例外（データ/例外.json） ----
+    // ---- 前の場所からの引っ越し（slack.py migrate） ----
+
+    /// 前の場所のデータを新しい場所へ引っ越す（確かめてから）。写す → 1つずつ同じか確かめる → 切り替える、は slack.py がする。
+    /// 途中でうまくいかなくても前のデータはそのまま。前のデータは「データ（引っ越し済み 日付）」の名前で残る
+    func migrate() {
+        guard !migrating, !running, let from = Paths.oldDataFolder else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "取ったデータを新しい場所へ引っ越しますか？"
+        a.informativeText = "前の場所: \(Paths.short(from.path))\n新しい場所: \(Paths.short(Paths.data.path))\n\n"
+            + "写して、1つずつ同じか確かめてから切り替えます。途中でうまくいかなくても、前のデータはそのままです。\n"
+            + "前のデータは「データ（引っ越し済み 日付）」という名前で残します。新しい場所で取得できたのを確かめてから、"
+            + "設定（歯車）の「保存先」でゴミ箱に入れてください。"
+        a.addButton(withTitle: "引っ越す")
+        a.addButton(withTitle: "やめる")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = [Paths.base.appendingPathComponent("slack.py").path, "migrate", from.path]
+        p.currentDirectoryURL = Paths.base
+        var env = Store.scriptEnvironment()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"   // 取得の仕組みのフォルダに __pycache__ を作らない
+        p.environment = env
+        // 引っ越しの前は新しい場所に記録を書けないので、出力は受け取ってアラートで見せる（数行だけ）
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        p.terminationHandler = { [weak self] proc in
+            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            Task { @MainActor in self?.migrated(status: proc.terminationStatus, output: text) }
+        }
+        do {
+            try p.run()
+            migrating = true
+        } catch {
+            message = "引っ越しを始められませんでした: \(error.localizedDescription)"
+        }
+    }
+
+    private func migrated(status: Int32, output: String) {
+        migrating = false
+        load()
+        if status == 0, let h = Store.appLog("引っ越し") { h.write(Data(output.utf8)) }   // 引っ越したあとは新しい場所に書ける
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.alertStyle = status == 0 ? .informational : .warning
+        a.messageText = status == 0 ? "引っ越しました" : "引っ越せませんでした（前のデータはそのままです）"
+        a.informativeText = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        a.addButton(withTitle: "OK")
+        a.runModal()
+        if status == 0 {
+            refreshStatus()   // 新しい場所のデータで、状況ページを数え直す
+            if configured {
+                if setup.show { setup.closeNow() }   // 前のデータで準備が済んでいた（はじめの準備から引っ越したとき）
+            } else if !setup.show {
+                AppDelegate.shared?.openSetup()
+            }
+        }
+    }
+
+    /// 前の版のデータがあるフォルダを選んで引っ越す。アプリが前のフォルダを覚えていないとき（前の版のアプリが古かった・
+    /// 別の Mac から写してきた、など）のため。はじめの準備の最初の画面と、設定の「保存先」から
+    func chooseOldData() {
+        guard !migrating, !running else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        panel.message = "前の版の、取得の仕組みのフォルダ（中に データ/ や、原本/・状態.json などがあるフォルダ）を選んでください"
+        panel.prompt = "このフォルダから引っ越す"
+        guard panel.runModal() == .OK, let picked = panel.url else { return }
+        guard Paths.hasOldData(picked) else {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = "このフォルダには、前の版のデータがありません"
+            a.informativeText = "選んだフォルダ（\(Paths.short(picked.path))）の中に、データ/ や、一番上の 原本/・状態.json などが見つかりませんでした。"
+                + "引っ越し済みのときは「データ（引っ越し済み …）」という名前になっています。"
+            a.addButton(withTitle: "OK")
+            a.runModal()
+            return
+        }
+        Paths.defaults.set(picked.path, forKey: "previousBaseDir")   // 前のデータを探す場所として覚える
+        load()
+        migrate()
+    }
+
+    /// 引っ越したあとに残してある前のデータを、ゴミ箱に入れる（確かめてから。ゴミ箱を空にするまでは戻せる）
+    func trashLeftovers() {
+        let items = Paths.movedLeftovers
+        guard !items.isEmpty else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "引っ越し前のデータをゴミ箱に入れますか？"
+        a.informativeText = items.map { Paths.short($0.path) }.joined(separator: "\n")
+            + "\n\n新しい場所（\(Paths.short(Paths.data.path))）で取得できたのを確かめてから入れてください。"
+            + "ゴミ箱を空にするまでは、Finder で戻せます。"
+        a.addButton(withTitle: "ゴミ箱に入れる")
+        a.addButton(withTitle: "やめる")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        var failed: [String] = []
+        for u in items {
+            do { try FileManager.default.trashItem(at: u, resultingItemURL: nil) } catch { failed.append(Paths.short(u.path)) }
+        }
+        message = failed.isEmpty ? nil : "ゴミ箱に入れられませんでした: " + failed.joined(separator: "・")
+        load()
+    }
+
+    // ---- 既知の例外（例外.json） ----
 
     static let threadRefRE = try! NSRegularExpression(pattern: "([CG][A-Z0-9]{6,20}) (\\d{10}\\.\\d{6})")
     /// 照合の行から、チャンネルの ID と投稿の時刻を取り出す
@@ -1095,7 +1285,10 @@ struct StatusCard: View {
                 DadsButton(title: "取得ログを開く", kind: .quiet, small: true) { store.openLatestLog() }
             }
             .padding(.top, 6)
-        case .fresh where !store.configured && !Store.needsMigrate:
+        case .fresh where Store.needsMigrate:
+            DadsButton(title: store.migrating ? "引っ越し中…" : "引っ越す", small: true, enabled: !store.migrating) { store.migrate() }
+                .padding(.top, 6)
+        case .fresh where !store.configured:
             DadsButton(title: "はじめの準備を開く", small: true) { AppDelegate.shared?.openSetup() }.padding(.top, 6)
         case .stale, .fresh:
             DadsButton(title: "今すぐ取る", small: true) { store.runNow() }.padding(.top, 6)
@@ -1191,7 +1384,10 @@ struct PopoverView: View {
                 case .ok:
                     DadsButton(title: "今すぐ取る") { store.runNow() }
                     DadsButton(title: "状況ページを開く", kind: .secondary, action: openStatus)
-                case .fresh where !store.configured && !Store.needsMigrate:
+                case .fresh where Store.needsMigrate:
+                    DadsButton(title: store.migrating ? "引っ越し中…" : "引っ越す", enabled: !store.migrating) { store.migrate() }
+                    DadsButton(title: "状況ページを開く", kind: .secondary, action: openStatus)
+                case .fresh where !store.configured:
                     DadsButton(title: "はじめの準備を開く", kind: .quiet) { AppDelegate.shared?.openSetup() }
                     DadsButton(title: "状況ページを開く", kind: .secondary, action: openStatus)
                 default:
@@ -1931,10 +2127,27 @@ struct SettingsSheet: View {
                     Toggle("", isOn: $store.showInDock).toggleStyle(SwitchStyle())
                 }
             case .base:
+                SettingRow(title: "取ったデータのフォルダ",
+                           sub: Paths.short(Paths.data.path) + "。取得の仕組みのフォルダの外にあるので、仕組みを新しい版に入れ替えても消えません") {
+                    DadsButton(title: "開く", kind: .quiet, small: true) { store.openFolder() }
+                }
                 SettingRow(title: "取得の仕組みのフォルダ",
                            sub: Paths.short(store.basePath) + (store.baseMissing ? "（取得係.sh が見つかりません）" : "")
-                               + "。フォルダを動かしても、同じ Mac の中なら自動で追いかけます", last: true) {
+                               + "。新しい版を別の場所で組み立て直したら、そちらを使います。フォルダを動かしても、同じ Mac の中なら追いかけます") {
                     DadsButton(title: "変更…", kind: .quiet, small: true) { store.chooseBase() }
+                }
+                SettingRow(title: "前の版のデータ",
+                           sub: "前の版（2026年10月より前）は、取ったデータを取得の仕組みのフォルダの中に置いていました。"
+                               + "「引っ越す」が出ないときは、ここで前のフォルダを選ぶと、新しい場所へ引っ越します",
+                           last: store.leftovers.isEmpty) {
+                    DadsButton(title: "選ぶ…", kind: .quiet, small: true, enabled: !store.migrating && !store.running) { store.chooseOldData() }
+                }
+                if !store.leftovers.isEmpty {
+                    SettingRow(title: "引っ越し前のデータ",
+                               sub: store.leftovers.map { Paths.short($0.path) }.joined(separator: "・")
+                                   + "。新しい場所で取得できたのを確かめてから、ゴミ箱に入れてください", last: true) {
+                        DadsButton(title: "ゴミ箱に入れる…", kind: .quiet, small: true) { store.trashLeftovers() }
+                    }
                 }
             }
         }
@@ -1973,8 +2186,8 @@ struct StatusContent: View {
             if let m = store.message {
                 Text(m).font(.system(size: 12)).foregroundStyle(Color.ngInk)
             }
-            Text("件数と日ごとの投稿は データ/チャンネル/ の記録から、取得の記録は データ/取得の記録.jsonl から出しています（フォルダ: "
-                 + (Paths.base.path as NSString).abbreviatingWithTildeInPath + "）。")
+            Text("件数と日ごとの投稿は チャンネル/ の記録から、取得の記録は 取得の記録.jsonl から出しています（データのフォルダ: "
+                 + Paths.short(Paths.data.path) + "）。")
                 .font(.system(size: 11)).foregroundStyle(Color.ink3)
         }
         .padding(24)
@@ -1998,7 +2211,9 @@ struct StatusContent: View {
             if store.running {
                 DadsButton(title: "止める", kind: .quiet, small: true) { store.stop() }
             }
-            if !store.configured && !store.running && !Store.needsMigrate {   // 取るチャンネルが無いうちは、はじめの準備から
+            if Store.needsMigrate && !store.running {   // 前の場所にデータがあれば、まず引っ越し
+                DadsButton(title: store.migrating ? "引っ越し中…" : "引っ越す", small: true, enabled: !store.migrating) { store.migrate() }
+            } else if !store.configured && !store.running {   // 取るチャンネルが無いうちは、はじめの準備から
                 DadsButton(title: "はじめの準備を開く", small: true) { AppDelegate.shared?.openSetup() }
             } else {
                 DadsButton(title: store.running ? "取得中…" : "今すぐ取る", small: true, enabled: !store.running) { store.runNow() }
@@ -2033,6 +2248,19 @@ struct StatusContent: View {
 
     // ---- 問題があるときだけ、見出しの下に1行で理由と次の一手 ----
     @ViewBuilder private var notice: some View {
+        if Store.needsMigrate {
+            // 前の場所にデータがある（失敗ではないので青で。ボタンは見出しの「引っ越す」）
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "arrow.right.circle.fill").foregroundStyle(Color.key)
+                Text(Store.migrateMessage).font(.system(size: 12)).foregroundStyle(Color.ink2).lineLimit(3)
+                Spacer()
+            }
+        } else {
+            displayNotice
+        }
+    }
+
+    @ViewBuilder private var displayNotice: some View {
         switch store.display {
         case .ng:
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -2238,6 +2466,14 @@ enum Snapshot {
     @MainActor
     static func run(dir: String) {
         SettingsSheet.maxGroupsHeight = nil   // 確認用の画像では、設定の窓を画面の高さで切らない
+        // 本物の設定と、本物の取ったデータは読まない（-dataDir を渡されたときだけ、そのデータで描く）
+        Paths.defaults = MemoryStore()
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("slack-fetch-snapshot-\(ProcessInfo.processInfo.processIdentifier)")
+        defer { try? fm.removeItem(at: work) }
+        if UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["dataDir"] == nil {
+            Paths.dataOverride = work.appendingPathComponent(Paths.dataFolderName)
+        }
         let states: [(String, DisplayState)] = [("ok", .ok), ("running", .running), ("ng", .ng), ("failed", .failed),
                                                 ("stale", .stale), ("fresh", .fresh)]
         for (name, st) in states {
@@ -2283,6 +2519,25 @@ enum Snapshot {
         s.previewWeekBar = (s.channels.first?.week ?? []).dropLast(2).last.flatMap { Fmt.parseJST($0.date + " 12:00:00") }
             .map { Fmt.string($0, "M/d") }
         render(StatusContent().environmentObject(s), to: "\(dir)/window_hover_chart_history.png", width: 1000)
+        // 前の場所（取得の仕組みのフォルダの中の データ/）にデータがあるとき: 「引っ越す」を出す
+        let savedBase = Paths.current
+        let old = work.appendingPathComponent("前の版/slack-fetch")
+        try? fm.createDirectory(at: old.appendingPathComponent("データ"), withIntermediateDirectories: true)
+        for f in Paths.required { fm.createFile(atPath: old.appendingPathComponent(f).path, contents: Data()) }
+        fm.createFile(atPath: old.appendingPathComponent("データ/チャンネル.json").path, contents: Data("[]\n".utf8))
+        let mig = Store(live: false)
+        Paths.current = old
+        mig.load()
+        prepare(mig, .fresh)
+        render(PopoverView().environmentObject(mig), to: "\(dir)/menu_migrate.png", width: 380)
+        render(StatusContent().environmentObject(mig), to: "\(dir)/window_migrate.png", width: 1000)
+        // 引っ越したあと、前のデータが残っているとき: 設定の「保存先」に「ゴミ箱に入れる…」を出す
+        try? fm.moveItem(at: old.appendingPathComponent("データ"), to: old.appendingPathComponent("データ（引っ越し済み 2026-10-13）"))
+        let moved = Store(live: false)
+        Paths.current = old
+        moved.load()
+        renderWindow(SettingsSheet().environmentObject(moved), to: "\(dir)/settings_window_leftover.png")
+        Paths.current = savedBase
         render(SettingsSheet().environmentObject(Store(live: false)), to: "\(dir)/settings.png", width: 580)
         // 設定の窓は、選択の欄（時刻・上限・モデル）も写るように本物の窓として描く
         renderWindow(SettingsSheet().environmentObject(Store(live: false)), to: "\(dir)/settings_window.png")
@@ -2376,6 +2631,7 @@ enum BaseTest {
         Paths.defaults = MemoryStore()   // 本物の設定（と設定のファイル）は触らない
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("slack-fetch-test-\(ProcessInfo.processInfo.processIdentifier)")
+        Paths.dataOverride = root.appendingPathComponent(Paths.dataFolderName)   // 本物の取ったデータも触らない
         defer { try? fm.removeItem(at: root) }
         var ng = 0
         func check(_ name: String, _ ok: Bool) { print((ok ? "OK  " : "NG  ") + name); if !ok { ng += 1 } }
@@ -2423,6 +2679,40 @@ enum BaseTest {
             try fm.removeItem(at: root.appendingPathComponent("E"))
             if case .missing(let last) = find() { check("消したら「見つからない」になり、前の場所を言える", last == e.path) }
             else { check("消したら「見つからない」になり、前の場所を言える", false) }
+
+            // 新しい版に入れ替えたとき（データはフォルダの外なので、探すのは台本の場所だけ。古い台本は動かさない）
+            let f = root.appendingPathComponent("F/slack-fetch")
+            try make(f)
+            Paths.remember(f)
+            try fm.moveItem(at: f, to: root.appendingPathComponent("F/slack-fetch-古い版"))
+            try make(f)
+            let sameNew = "同じ場所に新しい版を置けば、古いほうの名前を変えて残していても、新しい版を使う"
+            if case .same(let u) = find() { check(sameNew, same(u, f)) } else { check(sameNew, false) }
+
+            let g1 = root.appendingPathComponent("G/前の版/slack-fetch"), g2 = root.appendingPathComponent("G/新しい版/slack-fetch")
+            try make(g1)
+            try make(g2)
+            Paths.defaults.set(g1.path, forKey: "builtDirSeen")   // 前の版は g1 で組み立てて使っていた
+            Paths.remember(g1)
+            let rebuilt = "別の場所で組み立て直したら、そちら（新しい版）を使う（知らせは出さない）"
+            if case .same(let u) = Paths.resolve(built: g2) { check(rebuilt, same(u, g2)) } else { check(rebuilt, false) }
+            check("…前の場所を覚えておく（前のデータを探すため）", Paths.defaults.string(forKey: "previousBaseDir") == g1.path)
+            Paths.remember(g1)   // 設定の「変更…」で前の場所を選び直した
+            let picked = "同じ組み立てのまま、設定で選び直した場所はそのまま使う"
+            if case .same(let u) = Paths.resolve(built: g2) { check(picked, same(u, g1)) } else { check(picked, false) }
+
+            // 前のデータを探す（今のフォルダか、前に使っていたフォルダ）
+            Paths.current = g2
+            Paths.defaults.set(g1.path, forKey: "previousBaseDir")
+            check("前のデータが無ければ、引っ越しは要らない", Paths.oldDataFolder == nil)
+            try fm.createDirectory(at: g1.appendingPathComponent("データ"), withIntermediateDirectories: true)
+            fm.createFile(atPath: g1.appendingPathComponent("データ/状態.json").path, contents: Data("{}".utf8))
+            check("前に使っていたフォルダの データ/ に残っていれば見つける（別の場所で組み立て直したとき）",
+                  same(Paths.oldDataFolder, g1))
+            try fm.moveItem(at: g1.appendingPathComponent("データ"), to: g1.appendingPathComponent("データ（引っ越し済み 2026-10-13）"))
+            check("引っ越し済みの名前になれば引っ越しは要らず、ゴミ箱に入れる候補になる",
+                  Paths.oldDataFolder == nil && Paths.movedLeftovers.count == 1)
+            Paths.current = nil
         } catch {
             print("NG  準備で失敗: \(error)")
             ng += 1
@@ -2527,6 +2817,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// はじめの準備（Slack とチャンネル）の窓を、状況ページの上に開く。設定から開いたときは、閉じたら設定に戻す
     func openSetup(backToSettings: Bool = false) {
         showStatus()
+        // 前の場所にデータがあれば、先に引っ越し（準備で新しい場所に書くと、引っ越し先が空でなくなって引っ越せない）
+        if Store.needsMigrate {
+            store.migrate()
+            return
+        }
         store.setup.backToSettings = backToSettings
         store.setup.open()
     }

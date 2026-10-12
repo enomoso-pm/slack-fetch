@@ -5,12 +5,12 @@ Claude（または手伝い役）が Slack の読み取りツールを呼ぶと�
 Claude Code の作業記録（~/.claude/projects/.../*.jsonl）にそのまま残る。
 この道具はそこから中身を取り出して、チャンネルごとのフォルダの 原本/ に保存する。AI は中身を書き写さない。
 
-取ったもの・設定・状態は、すべて データ/ に置く（公開しないのはこのフォルダだけ）:
-  データ/チャンネル.json                        取るチャンネルの一覧（自分で書く）
-  データ/状態.json・取得の記録.jsonl・例外.json  状態（メニューバーのアプリが読む）
-  データ/チャンネル/<名前>__<ID>/記録.jsonl      1投稿1行の記録
-  データ/チャンネル/<名前>__<ID>/原本/<年-月>/   Slack から返ってきたそのまま（投稿の月ごと）
-  データ/取得ログ/<年-月>/                       取得の周ごとの一覧・結果・まとめ
+取ったもの・設定・状態は、すべてホームの直下の Slack取得データ/ に置く（この取得の仕組みのフォルダの外）:
+  Slack取得データ/チャンネル.json                        取るチャンネルの一覧（自分で書く）
+  Slack取得データ/状態.json・取得の記録.jsonl・例外.json  状態（メニューバーのアプリが読む）
+  Slack取得データ/チャンネル/<名前>__<ID>/記録.jsonl      1投稿1行の記録
+  Slack取得データ/チャンネル/<名前>__<ID>/原本/<年-月>/   Slack から返ってきたそのまま（投稿の月ごと）
+  Slack取得データ/取得ログ/<年-月>/                       取得の周ごとの一覧・結果・まとめ
 
 使い方:
   python3 slack.py plan    <チャンネルID> <開始日> <終了日> [...]  まだ取っていない／取り直す呼び出しの一覧を出す
@@ -19,8 +19,10 @@ Claude Code の作業記録（~/.claude/projects/.../*.jsonl）にそのまま�
   python3 slack.py build                          原本から事実の記録（チャンネルごとの 記録.jsonl、1件1行）を作る
   python3 slack.py check                          照合（スレッドの返信数と、実際に取れた数が合うか）
   python3 slack.py status  running|done|refresh   状態.json を書く（メニューバーのアプリが読む）
-  python3 slack.py migrate                        前の形（このフォルダの一番上に 原本/・記録/ などがある形）から データ/ に引っ越す
-  python3 slack.py channels 作業記録.jsonl --answer 出力.json   チャンネル探しの結果を照らして データ/チャンネル候補.json に書く
+  python3 slack.py where                          データの場所を出す
+  python3 slack.py migrate [前のフォルダ]         前の場所（取得の仕組みのフォルダの中の データ/ や、一番上の 原本/ など）から
+                                                  Slack取得データ/ に引っ越す（前のフォルダを省くと、このフォルダ）
+  python3 slack.py channels 作業記録.jsonl --answer 出力.json   チャンネル探しの結果を照らして チャンネル候補.json に書く
   python3 slack.py oldest  plan|read|done ...     できた日が分からないチャンネルの、いちばん古い投稿の月を探す
 """
 import base64
@@ -31,11 +33,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 取ったもの・設定・状態は、すべて データ/ に置く（公開しないのはこのフォルダだけ）
-DATA = os.path.join(HERE, "データ")
+# 取ったもの・設定・状態は、取得の仕組みのフォルダ（このフォルダ）の外の、ホームの直下の Slack取得データ/ に置く。
+# このフォルダは GitHub から取ってきて入れ替えたり、公開したりする。中にデータを置くと、入れ替えで消えたり、
+# 公開リポジトリに入ったりするため。場所は SLACK_FETCH_DATA で変えられる（試しのとき用。アプリと台本も同じ決まりで決める）
+DATA_NAME = "Slack取得データ"
+DATA = os.path.abspath(os.path.expanduser(os.environ.get("SLACK_FETCH_DATA") or os.path.join("~", DATA_NAME)))
 CH_ROOT = os.path.join(DATA, "チャンネル")          # 1チャンネル1フォルダ（<名前>__<ID>）。中に 記録.jsonl と 原本/<年-月>/
 OTHER_RAW = os.path.join(DATA, "その他", "原本")     # どのチャンネルの呼び出しか分からないもの
 LOG_ROOT = os.path.join(DATA, "取得ログ")           # 取得の周ごとの一覧・結果・まとめ（月ごと）
@@ -130,17 +137,22 @@ def recent_logs():
 _CH_DIRS = {}
 
 
+def safe_name(name):
+    """チャンネルの名前を、フォルダの名前に使える形にする（使えない文字は _ にする）"""
+    n = re.sub(r"[/:\\\x00-\x1f]", "_", (name or "").lstrip("#").strip()).strip(". ")
+    return n[:60]
+
+
 def channel_name(ch):
-    """チャンネル.json の名前（無ければ空）。フォルダの名前に使えない文字は _ にする"""
+    """チャンネル.json の名前（無ければ空）"""
     for c in read_json(CHANNELS_PATH, []):
         if c.get("id") == ch:
-            n = re.sub(r"[/:\\\x00-\x1f]", "_", (c.get("name") or "").lstrip("#").strip()).strip(". ")
-            return n[:60]
+            return safe_name(c.get("name"))
     return ""
 
 
 def channel_dir(ch, create=False):
-    """チャンネルのフォルダ（データ/チャンネル/<名前>__<ID>）。名前があとで変わっても、ID で見つける"""
+    """チャンネルのフォルダ（Slack取得データ/チャンネル/<名前>__<ID>）。名前があとで変わっても、ID で見つける"""
     if ch not in _CH_DIRS and os.path.isdir(CH_ROOT):
         for e in os.listdir(CH_ROOT):
             if e == ch or e.endswith("__" + ch):
@@ -437,6 +449,19 @@ def thread_failed_forms(ch, pts):
     return {i for i in (form_index(pts, c) for c in WRONG_THREAD_CALLS.get((ch, pts), [])) if i is not None}
 
 
+# 形が崩れていた原本のうち、同じものを取り直して取れているもの（原本のファイル名）。build_records が埋める
+COVERED_BAD = []
+
+
+def call_target(call):
+    """呼び出しが何を取りに行ったか。同じチャンネルの同じ区切り・同じスレッドの同じページなら同じ
+    （スレッドの呼び方〈oldest〉の違いは同じとみなす）"""
+    i = call.get("input") or {}
+    if call["tool"] == "slack_read_thread":
+        return (call["tool"], i.get("channel_id"), i.get("message_ts"), i.get("cursor"))
+    return (call["tool"], i.get("channel_id"), i.get("oldest"), i.get("latest"), i.get("cursor"))
+
+
 def build_records(ch=None):
     """原本を全部読んで、(チャンネル, ts) ごとに1件にまとめる。新しく取ったものが勝つ。
     ch を渡すと、そのチャンネルの分だけ（計画を立てるときに、ほかのチャンネルを読まずに済む）。
@@ -450,13 +475,19 @@ def build_records(ch=None):
     calls = [c for c in load_raw(ch) if c["tool"] in ("slack_read_channel", "slack_read_thread")]
     records, problems = {}, []
     WRONG_THREAD_CALLS.clear()
+    COVERED_BAD.clear()
+    good_targets = {call_target(c) for c in calls if c.get("parse_ok")}
 
     # 1) スレッドの呼び出しを、実際に返ってきた親の投稿ごとに分ける
     #    （Slack の道具は oldest なしで開くと、ときどき別の投稿のスレッドを返すため）
     tcalls, reply_parent = {}, {}
     for call in calls:
         if not call.get("parse_ok"):
-            problems.append("形の崩れた原本: %s" % call["raw_file"])
+            # 一時的なエラー（502 など）で形が崩れても、同じものを取り直して取れていれば問題にしない（取れていなければ NG）
+            if call_target(call) in good_targets:
+                COVERED_BAD.append(call["raw_file"])
+            else:
+                problems.append("形の崩れた原本: %s" % call["raw_file"])
             continue
         if call["tool"] != "slack_read_thread":
             continue
@@ -542,14 +573,14 @@ def cmd_build(_args):
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         tops = sum(1 for r in recs if not r["thread_ts"])
         print("%s: %d 件（親の投稿 %d・返信 %d）→ %s" % (ch, len(recs), tops, len(recs) - tops,
-                                                    os.path.relpath(path, HERE)))
+                                                    os.path.relpath(path, DATA)))
     for p in problems:
         print("注意:", p)
     return 0
 
 
 def listed_channels():
-    """表示と照合に使うチャンネルの ID（データ/チャンネル.json にあるもの）。一覧が無ければ None（取ったものを全部使う）。
+    """表示と照合に使うチャンネルの ID（チャンネル.json にあるもの）。一覧が無ければ None（取ったものを全部使う）。
     一覧から外したチャンネルの取ったデータは消さずに残し、表示と照合には使わない（付け直せば続きから取る）"""
     ids = {c["id"] for c in read_json(CHANNELS_PATH, []) if c.get("id")}
     return ids or None
@@ -557,11 +588,12 @@ def listed_channels():
 
 def run_check():
     """照合。戻り値: (表示する行, NG の数, 確かめたスレッドの数, 知らせ, 項目ごとの結果)。
-    照合するのは一覧（データ/チャンネル.json）にあるチャンネルだけ"""
+    照合するのは一覧（チャンネル.json）にあるチャンネルだけ"""
     records, threads, problems = build_records()
     raw_all = load_raw()
     use = listed_channels()
     shelved = set()
+    shelved_files = set()
     if use is not None:
         shelved = {call_channel(c) for c in raw_all} - use - {None}
         records = {k: r for k, r in records.items() if r["channel"] in use}
@@ -574,6 +606,10 @@ def run_check():
     if shelved:
         notes.append("一覧から外したチャンネル %d 本の取ったデータは、表示と照合に使っていません"
                      "（消してはいません。付け直せば続きから取ります）" % len(shelved))
+    covered = [f for f in COVERED_BAD if f not in shelved_files]
+    if covered:
+        notes.append("形の崩れた原本 %d 件は、同じものを取り直して取れているので NG にしていません（一時的なエラーなど）"
+                     % len(covered))
     # Slack 側の食い違いで取りようがないと分かったものは 例外.json に理由付きで書く。
     # 黙って飛ばさず、照合のたびに「既知の例外」として表示する
     exc_path = EXC_PATH
@@ -1139,48 +1175,237 @@ def cmd_status(args):
     return 0
 
 
-def cmd_migrate(_args):
-    """前の形（このフォルダの一番上に 原本/・記録/・状態.json などがある形）から、データ/ の形に引っ越す。
-    中身は変えずに場所だけ移す。取得中は引っ越さない。"""
-    if os.path.exists(os.path.join(HERE, ".取得中")):
-        print("取得中（.取得中 がある）なので引っ越しません。取得が終わってから、もう一度動かしてください。")
-        return 3
-    os.makedirs(DATA, exist_ok=True)
-    n = {"設定と状態": 0, "原本": 0, "記録": 0, "取得ログ": 0}
-    for name in ("チャンネル.json", "状態.json", "取得の記録.jsonl", "例外.json", "チャンネル候補.json"):   # チャンネルの名前を使うので先に
-        src, dst = os.path.join(HERE, name), os.path.join(DATA, name)
-        if os.path.exists(src) and not os.path.exists(dst):
-            os.replace(src, dst)
-            n["設定と状態"] += 1
-    old = os.path.join(HERE, "原本")
-    if os.path.isdir(old):
-        for f in sorted(os.listdir(old)):
-            if f.endswith(".json"):
-                with open(os.path.join(old, f), encoding="utf-8") as fh:
-                    call = json.load(fh)
-                dst = raw_path(call)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                os.replace(os.path.join(old, f), dst)
-                n["原本"] += 1
-    old = os.path.join(HERE, "記録")
-    if os.path.isdir(old):
-        for f in sorted(os.listdir(old)):
-            if f.endswith(".jsonl"):
-                os.replace(os.path.join(old, f), os.path.join(channel_dir(f[:-len(".jsonl")], create=True), "記録.jsonl"))
-                n["記録"] += 1
-    old = os.path.join(HERE, "取得ログ")
-    if os.path.isdir(old):
-        for f in sorted(os.listdir(old)):
-            m = re.match(r"(\d{4})(\d{2})\d{2}-", f)
-            d = os.path.join(LOG_ROOT, "%s-%s" % m.groups()) if m else LOG_ROOT
-            os.makedirs(d, exist_ok=True)
-            os.replace(os.path.join(old, f), os.path.join(d, f))
-            n["取得ログ"] += 1
-    for name in ("原本", "記録", "取得ログ"):   # 空になった前のフォルダを片付ける
-        d = os.path.join(HERE, name)
-        if os.path.isdir(d) and not os.listdir(d):
-            os.rmdir(d)
-    print("引っ越しました: " + "・".join("%s %d" % kv for kv in n.items()))
+# ---- 前の場所からの引っ越し ----
+#
+# 2026-10 までは、取ったものを取得の仕組みのフォルダの中の データ/ に置いていた（もっと前は、フォルダの一番上に
+# 原本/・記録/・状態.json など）。どちらも、新しい場所（DATA）へ「写す → 1つずつ同じか確かめる → 切り替える」で引っ越す。
+# 途中で失敗したら写しかけを捨てるだけで、前のデータには触らない（もう一度動かせば、初めからやり直す）。
+# うまくいったら、前のデータは「データ（引っ越し済み 日付）」に名前を変えて、同じフォルダに残す（見張りはこの名前を見ない。
+# .gitignore でも外してある）。消すのは、新しい場所で取れたのを確かめてから、別の手順で（アプリの設定か Finder で）
+
+OLD_TOP = ("原本", "記録", "取得ログ", "チャンネル.json", "外したチャンネル.json", "チャンネル候補.json",
+           "状態.json", "取得の記録.jsonl", "例外.json")   # もっと前の形で、フォルダの一番上にあったもの
+MOVED_PREFIX = "データ（引っ越し済み"
+MIGRATE_NOTE = ".引っ越しの記録.json"   # 新しい場所に書く（どこから・何ファイル・何バイト）
+
+
+def short(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
+
+
+def same_place(a, b):
+    """同じフォルダか（日本語の名前は、濁点の持ち方〈NFC・NFD〉が違っても同じとみなす）"""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        norm = lambda p: unicodedata.normalize("NFC", os.path.realpath(p))
+        return norm(a) == norm(b)
+
+
+def old_data_kinds(folder):
+    """取得の仕組みのフォルダに残っている前のデータ。"データ"（中の データ/）と "一番上"（もっと前の形）のうち、あるもの"""
+    if same_place(folder, DATA):   # データの場所を、わざとこのフォルダにしている
+        return []
+    kinds = []
+    inner = os.path.join(folder, "データ")
+    if os.path.isdir(inner) and not same_place(inner, DATA) and any(e != ".DS_Store" for e in os.listdir(inner)):
+        kinds.append("データ")
+    if any(os.path.lexists(os.path.join(folder, n)) for n in OLD_TOP):
+        kinds.append("一番上")
+    return kinds
+
+
+OLD_DATA_MESSAGE = ("前の場所にデータがあります（%s）。先に、新しい場所（%s）へ引っ越してください: "
+                    "アプリの「引っ越す」を押すか、このフォルダで python3 slack.py migrate を動かす（前のデータは消しません）")
+
+
+def lock_alive(lock_dir):
+    """取得中の印（.取得中/pid）の取得が、まだ動いているか"""
+    try:
+        with open(os.path.join(lock_dir, "pid"), encoding="utf-8") as f:
+            os.kill(int(f.read().strip()), 0)
+        return True
+    except PermissionError:   # 動いているが、ほかの人のもの
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def migrate_files(src, kinds):
+    """前のデータのファイルと、新しい場所での置き場所（DATA からの相対）の組。
+    取得中の印（.取得中/）・書きかけ（.tmp）・.DS_Store は写さない"""
+    pairs = []
+    if "データ" in kinds:   # 2026-10 までの形: そのままの並びで写す
+        root = os.path.join(src, "データ")
+        for dp, dns, fns in os.walk(root):
+            dns[:] = sorted(d for d in dns if d != ".取得中")
+            for f in sorted(fns):
+                if f != ".DS_Store" and not f.endswith(".tmp"):
+                    p = os.path.join(dp, f)
+                    pairs.append((p, os.path.relpath(p, root)))
+    if "一番上" in kinds:   # もっと前の形: チャンネルごと・月ごとのフォルダに分けて置く（前の migrate と同じ置き方）
+        # チャンネルのフォルダの名前: 途中まで データ/ に移してあれば、そのフォルダの名前をそのまま使う。
+        # 無ければ チャンネル.json の名前（データ/ の中のものが勝つ。前の migrate も、そちらを読んでいた）
+        folders, names = {}, {}
+        inner_ch = os.path.join(src, "データ", "チャンネル")
+        for e in (os.listdir(inner_ch) if os.path.isdir(inner_ch) else []):
+            folders[e.rsplit("__", 1)[-1]] = e
+        for path in (os.path.join(src, "チャンネル.json"), os.path.join(src, "データ", "チャンネル.json")):
+            for c in read_json(path, []):
+                if isinstance(c, dict) and c.get("id") and safe_name(c.get("name")):
+                    names[c["id"]] = safe_name(c["name"])
+
+        def ch_folder(ch):
+            if ch in folders:
+                return os.path.join("チャンネル", folders[ch])
+            return os.path.join("チャンネル", "%s__%s" % (names[ch], ch) if names.get(ch) else ch)
+
+        for n in OLD_TOP:
+            if os.path.isfile(os.path.join(src, n)):
+                pairs.append((os.path.join(src, n), n))
+        for dp, dns, fns in os.walk(os.path.join(src, "原本")):
+            dns.sort()
+            for f in sorted(fns):
+                if not f.endswith(".json"):
+                    continue
+                p = os.path.join(dp, f)
+                call = read_json(p, None)
+                ch = call_channel(call) if isinstance(call, dict) else None
+                month = call_month(call) if isinstance(call, dict) else time.strftime("%Y-%m", time.localtime(os.path.getmtime(p)))
+                pairs.append((p, os.path.join(ch_folder(ch) if ch else "その他", "原本", month, f)))
+        for dp, dns, fns in os.walk(os.path.join(src, "記録")):
+            for f in sorted(fns):
+                if f.endswith(".jsonl"):
+                    pairs.append((os.path.join(dp, f), os.path.join(ch_folder(f[:-len(".jsonl")]), "記録.jsonl")))
+        logs = os.path.join(src, "取得ログ")
+        for dp, dns, fns in os.walk(logs):
+            dns.sort()
+            for f in sorted(fns):
+                if f == ".DS_Store":
+                    continue
+                p = os.path.join(dp, f)
+                rel = os.path.relpath(p, logs)
+                if os.sep not in rel:   # 一番上に並んでいた取得ログは、月ごとのフォルダへ
+                    m = re.match(r"(\d{4})(\d{2})\d{2}-", f)
+                    rel = os.path.join("%s-%s" % m.groups(), f) if m else f
+                pairs.append((p, os.path.join("取得ログ", rel)))
+    # 同じ置き場所に2つ来たら: 中身が同じなら1つにする。違えば、どちらかを失うので引っ越さない
+    out, seen = [], {}
+    for p, rel in pairs:
+        if rel in seen:
+            if file_sha(p) != file_sha(seen[rel]):
+                raise ValueError("同じ置き場所（%s）に、中身の違う2つのファイルがあります: %s と %s" % (rel, seen[rel], p))
+            continue
+        seen[rel] = p
+        out.append((p, rel))
+    return out
+
+
+def cmd_where(_args):
+    """データの場所を出す（前の場所にデータが残っていれば、それも言う）"""
+    print(DATA)
+    if old_data_kinds(HERE):
+        print(OLD_DATA_MESSAGE % (short(HERE), short(DATA)))
+    return 0
+
+
+def cmd_guard(_args):
+    """前の場所にデータが残っていなければ 0（残っていれば main が 4 で止める）。台本が最初に呼んで確かめる"""
+    return 0
+
+
+def cmd_migrate(args):
+    """前の場所（取得の仕組みのフォルダの中）のデータを、新しい場所（Slack取得データ/）へ引っ越す。
+      python3 slack.py migrate [前のフォルダ]   … 前のフォルダを省くと、このフォルダ
+    写す → 1つずつ同じか確かめる → 新しい場所に切り替える、の順。途中で失敗しても前のデータには触らない
+    （もう一度動かせばやり直す）。うまくいったら、前のデータは「データ（引っ越し済み 日付）」に名前を変えて残す"""
+    src = os.path.abspath(os.path.expanduser(args[0])) if args else HERE
+    if not os.path.isdir(src):
+        print("前のフォルダが見つかりません: %s" % src)
+        return 2
+    kinds = old_data_kinds(src)
+    if not kinds:
+        print("引っ越すものはありません（%s に前のデータはありません）。データの場所: %s" % (short(src), short(DATA)))
+        return 0
+    for lock in (os.path.join(src, "データ", ".取得中"), os.path.join(src, ".取得中"), os.path.join(DATA, ".取得中")):
+        if os.path.isdir(lock) and lock_alive(lock):
+            print("取得中なので引っ越しません。取得が終わってから、もう一度動かしてください。")
+            return 3
+    try:
+        pairs = migrate_files(src, kinds)
+    except (OSError, ValueError) as e:
+        print("引っ越しをやめました（前のデータはそのまま）: %s" % e)
+        return 1
+    total = sum(os.path.getsize(p) for p, _ in pairs)
+    # 写して切り替えたあと、前のデータに名前を付ける前に止まっていたら、名前を付けるところから続ける
+    note = read_json(os.path.join(DATA, MIGRATE_NOTE), None)
+    if (isinstance(note, dict) and same_place(note.get("from") or "", src)
+            and note.get("files") == len(pairs) and note.get("bytes") == total):
+        return finish_migrate(src, kinds, len(pairs), total)
+    if os.path.lexists(DATA) and (not os.path.isdir(DATA) or any(e != ".DS_Store" for e in os.listdir(DATA))):
+        print("新しい場所（%s）には、すでにデータがあります。混ぜないように、引っ越さずに止めます。" % short(DATA))
+        print("どちらを使うか決めて、使わないほうを別の場所へ移してから、もう一度動かしてください（前のデータはそのまま）。")
+        return 5
+    # 写しかけは新しい場所の隣に作る（最後の切り替えが、同じディスクの中での名前の付け替えで済むように）
+    tmp = os.path.join(os.path.dirname(DATA), "." + os.path.basename(DATA) + "（引っ越し中）")
+    try:
+        if os.path.lexists(tmp):
+            shutil.rmtree(tmp)   # 前に失敗したときの写しかけ（前のデータではない）
+        os.makedirs(tmp)
+        for p, rel in pairs:
+            d = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copy2(p, d)
+        # 確かめる: ファイルの数・大きさ・中身（sha256）が、前のデータと1つずつ同じか
+        copied = sum(len(fns) for _, _, fns in os.walk(tmp))
+        bad = [rel for p, rel in pairs
+               if os.path.getsize(p) != os.path.getsize(os.path.join(tmp, rel)) or file_sha(p) != file_sha(os.path.join(tmp, rel))]
+        if copied != len(pairs) or bad:
+            raise OSError("写したものが前のデータと合いません（数 %d / %d・違うもの %d）" % (copied, len(pairs), len(bad)))
+        write_json(os.path.join(tmp, MIGRATE_NOTE), {"from": src, "kinds": kinds, "files": len(pairs), "bytes": total,
+                                                      "at": now_iso()})
+        if os.path.isdir(DATA):   # 空のフォルダ（.DS_Store だけ）なら片付けてから切り替える
+            if os.path.exists(os.path.join(DATA, ".DS_Store")):
+                os.remove(os.path.join(DATA, ".DS_Store"))
+            os.rmdir(DATA)
+        os.makedirs(os.path.dirname(DATA), exist_ok=True)
+        os.rename(tmp, DATA)
+    except OSError as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("引っ越しの途中でうまくいかなかったので、やめました（前のデータはそのまま）: %s" % e)
+        print("原因を直してから、もう一度動かしてください（初めからやり直します）。")
+        return 1
+    return finish_migrate(src, kinds, len(pairs), total)
+
+
+def finish_migrate(src, kinds, files, total):
+    """切り替えのあと: 前のデータに「データ（引っ越し済み 日付）」と名前を付けて残す（同じフォルダの中での名前の付け替え）"""
+    stamp = time.strftime("%Y-%m-%d")
+    moved = os.path.join(src, "%s %s）" % (MOVED_PREFIX, stamp))
+    i = 2
+    while os.path.lexists(moved):
+        moved = os.path.join(src, "%s %s-%d）" % (MOVED_PREFIX, stamp, i))
+        i += 1
+    if kinds == ["データ"]:
+        os.rename(os.path.join(src, "データ"), moved)
+    else:
+        os.makedirs(moved)
+        for n in ("データ",) + OLD_TOP + (".取得中",):
+            if (n != "データ" or "データ" in kinds) and os.path.lexists(os.path.join(src, n)):
+                os.rename(os.path.join(src, n), os.path.join(moved, n))
+    print("引っ越しました: %d ファイル（%.1f MB）を写して、1つずつ同じことを確かめました。" % (files, total / 1e6))
+    print("新しい場所: %s" % short(DATA))
+    print("前のデータは %s に残してあります。新しい場所で取得できたのを確かめてから消してください"
+          "（アプリの設定の「ゴミ箱に入れる」か、Finder で）。" % short(moved))
     return 0
 
 
@@ -1190,7 +1415,7 @@ def cmd_migrate(_args):
 # AI が書き写した ID と名前は、Slack が返したそのままの結果（作業記録）にあるものだけを使う。投稿の中身は読ませない
 
 CHANNEL_TOOL = "slack_search_channels"
-CANDIDATES_PATH = os.path.join(DATA, "チャンネル候補.json")   # アプリが読む（公開しない データ/ の中）
+CANDIDATES_PATH = os.path.join(DATA, "チャンネル候補.json")   # アプリが読む（取得の仕組みのフォルダの外の Slack取得データ/ の中）
 CHANNEL_ID_RE = re.compile(r"^[CG][A-Z0-9]{6,20}$")
 NO_TOOL_RE = re.compile(r"No such tool", re.I)
 MONTH_NAMES = "jan feb mar apr may jun jul aug sep oct nov dec".split()
@@ -1430,11 +1655,15 @@ def cmd_oldest(args):
 
 def main(argv):
     cmds = {"extract": cmd_extract, "usage": cmd_usage, "build": cmd_build, "check": cmd_check,
-            "plan": cmd_plan, "status": cmd_status, "migrate": cmd_migrate,
+            "plan": cmd_plan, "status": cmd_status, "migrate": cmd_migrate, "where": cmd_where, "guard": cmd_guard,
             "channels": cmd_channels, "oldest": cmd_oldest}
     if len(argv) < 2 or argv[1] not in cmds:
         print(__doc__)
         return 2
+    # 前の場所にデータが残っているうちは、新しい場所に書かない（先に書くと、引っ越し先が空でなくなって引っ越せない）
+    if argv[1] not in ("migrate", "where", "usage") and old_data_kinds(HERE):
+        print(OLD_DATA_MESSAGE % (short(HERE), short(DATA)))
+        return 4
     return cmds[argv[1]](argv[2:])
 
 
