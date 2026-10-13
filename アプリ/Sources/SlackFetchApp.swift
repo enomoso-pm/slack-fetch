@@ -214,7 +214,12 @@ enum Paths {
         return nil
     }
 
-    static func short(_ p: String) -> String { (p as NSString).abbreviatingWithTildeInPath }
+    /// 確認用の画像で、この場所をホーム（~）として出す（一時フォルダの長い名前を、手順書などの画像に出さないため）
+    static var displayHome: String?
+    static func short(_ p: String) -> String {
+        if let h = displayHome, p == h || p.hasPrefix(h + "/") { return "~" + p.dropFirst(h.count) }
+        return (p as NSString).abbreviatingWithTildeInPath
+    }
 
     /// 取ったもの・設定・状態の置き場所。取得の仕組みのフォルダの外（入れ替えても消えず、公開リポジトリにも入らない）。
     /// 決まりは台本・slack.py と同じ: SLACK_FETCH_DATA があればそこ、無ければホームの直下の Slack取得データ
@@ -2473,7 +2478,9 @@ enum Snapshot {
         defer { try? fm.removeItem(at: work) }
         if UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["dataDir"] == nil {
             Paths.dataOverride = work.appendingPathComponent(Paths.dataFolderName)
+            Paths.displayHome = work.path   // 画像の中の場所は ~/Slack取得データ・~/slack-fetch のように出す
         }
+        defer { Paths.displayHome = nil }
         let states: [(String, DisplayState)] = [("ok", .ok), ("running", .running), ("ng", .ng), ("failed", .failed),
                                                 ("stale", .stale), ("fresh", .fresh)]
         for (name, st) in states {
@@ -2520,13 +2527,19 @@ enum Snapshot {
             .map { Fmt.string($0, "M/d") }
         render(StatusContent().environmentObject(s), to: "\(dir)/window_hover_chart_history.png", width: 1000)
         // 前の場所（取得の仕組みのフォルダの中の データ/）にデータがあるとき: 「引っ越す」を出す
+        // 新しい版を別のフォルダ（slack-fetch-new）で組み立て直し、前の版のフォルダ（slack-fetch）を覚えている、という場面
         let savedBase = Paths.current
-        let old = work.appendingPathComponent("前の版/slack-fetch")
+        let newBase = work.appendingPathComponent("slack-fetch-new"), old = work.appendingPathComponent("slack-fetch")
+        for d in [newBase, old] {
+            try? fm.createDirectory(at: d, withIntermediateDirectories: true)
+            for f in Paths.required { fm.createFile(atPath: d.appendingPathComponent(f).path, contents: Data()) }
+        }
         try? fm.createDirectory(at: old.appendingPathComponent("データ"), withIntermediateDirectories: true)
-        for f in Paths.required { fm.createFile(atPath: old.appendingPathComponent(f).path, contents: Data()) }
         fm.createFile(atPath: old.appendingPathComponent("データ/チャンネル.json").path, contents: Data("[]\n".utf8))
+        Paths.defaults.set(old.path, forKey: "previousBaseDir")
         let mig = Store(live: false)
-        Paths.current = old
+        Paths.current = newBase
+        mig.basePath = newBase.path
         mig.load()
         prepare(mig, .fresh)
         render(PopoverView().environmentObject(mig), to: "\(dir)/menu_migrate.png", width: 380)
@@ -2534,9 +2547,11 @@ enum Snapshot {
         // 引っ越したあと、前のデータが残っているとき: 設定の「保存先」に「ゴミ箱に入れる…」を出す
         try? fm.moveItem(at: old.appendingPathComponent("データ"), to: old.appendingPathComponent("データ（引っ越し済み 2026-10-13）"))
         let moved = Store(live: false)
-        Paths.current = old
+        Paths.current = newBase
+        moved.basePath = newBase.path
         moved.load()
         renderWindow(SettingsSheet().environmentObject(moved), to: "\(dir)/settings_window_leftover.png")
+        Paths.defaults.set(nil, forKey: "previousBaseDir")
         Paths.current = savedBase
         render(SettingsSheet().environmentObject(Store(live: false)), to: "\(dir)/settings.png", width: 580)
         // 設定の窓は、選択の欄（時刻・上限・モデル）も写るように本物の窓として描く
