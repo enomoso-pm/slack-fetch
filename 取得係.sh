@@ -15,6 +15,8 @@
 #      取得係にはファイルを読む道具もコマンドを打つ道具も渡さない（寄り道させない）
 #   3. slack.py extract が、置かれたファイルから原本を保存する
 #   一覧が空になるまで繰り返し、最後に記録を作って照合し、状態.json に結果を書いて通知する。
+#   空で返ってきたが、あとで同じものを取り直せた原本（Mac のスリープや一時的なエラーなどで）は、記録を作る前に よけた原本/ へ移す。
+#   取得の途中で Mac が眠っていた間は、Mac の電源の記録から調べて、まとめ・状態.json・通知に出す（slack.py status done）。
 #   取ったもの・設定・状態・取得ログは、すべてホームの直下の Slack取得データ/ に置く（このフォルダの外。
 #   このフォルダは入れ替えたり公開したりするため）。場所は SLACK_FETCH_DATA で変えられる（試しのとき用）
 #
@@ -136,6 +138,8 @@ elif [ "$MODE" = "毎日" ] && [ ${#JOBS[@]} -eq 0 ]; then
   PRECHECK="取るチャンネルが無い。アプリの「はじめの準備」で選ぶか、チャンネル.例.json を写して ${DATA}/チャンネル.json を作り、取りたいチャンネルを書く"
 fi
 
+# 予定の時刻（毎朝 9:00 など）に Mac がスリープしていたので、起きてから始めたとき（アプリが SLEEP_DELAYED に予定の時刻を渡す）
+[ -n "${SLEEP_DELAYED:-}" ] && echo "予定の ${SLEEP_DELAYED} は Mac がスリープしていたので、起きてから始めます" | tee -a "$SUMMARY"
 echo "取得を始めます（${MODE}・モデル ${MODEL}）" | tee -a "$SUMMARY"
 [ "$MODE" = "毎日" ] && echo "  チャンネル ${#JOBS[@]} 本・直近2週間は取り直し・${SEARCH_AFTER} より後の返信を検索" | tee -a "$SUMMARY"
 
@@ -282,6 +286,11 @@ EOF
   fi
 done
 
+# 空で返ってきたが、あとで同じものを取り直せた原本（Mac のスリープなどで）を、よけた原本/ に移す（消さない）
+ASIDE=$("$PY" "$SLACK_PY" set-aside)
+[ -n "$ASIDE" ] && echo "$ASIDE" | tee -a "$SUMMARY"
+ASIDE_N=$(printf '%s\n' "$ASIDE" | sed -nE 's/^よけた原本: ([0-9]+) 件.*/\1/p')
+
 echo "記録を作って照合します…" | tee -a "$SUMMARY"
 "$PY" "$SLACK_PY" build | tee -a "$SUMMARY"
 "$PY" "$SLACK_PY" check | tee -a "$SUMMARY"
@@ -304,13 +313,21 @@ EOF
 echo "周の数: ${ROUNDS} / やりとりの回数: ${TURNS}" | tee -a "$SUMMARY"
 echo "API換算の目安: ${COST} ドル（請求ではありません。プランの利用枠をこのくらい使った、という目安です）" | tee -a "$SUMMARY"
 
-STATUS_LINE=$("$PY" "$SLACK_PY" status done --run-start "$RUN_START" --result "$RESULT" --cost "$COST" \
-  --rounds "$ROUNDS" --turns "$TURNS" ${NOTE:+--note "$NOTE"})
-echo "$STATUS_LINE" | tee -a "$SUMMARY"
-case "$STATUS_LINE" in
-  *"状態: ok"*)      notify "取得できました" "${STATUS_LINE#状態: }" ;;
-  *"状態: ng"*)      notify "照合で合わないものがあります" "メニューバーのアプリで確かめてください" ;;
-  *"状態: stopped"*) notify "途中で止めました" "${NOTE}" ;;
-  *)                 notify "取得に失敗しました" "${NOTE}" ;;
-esac
+# 途中で Mac が眠っていたら、その行が「状態: …」の前に出る。通知に使うのは最後の行（状態: …）
+STATUS_OUT=$("$PY" "$SLACK_PY" status done --run-start "$RUN_START" --result "$RESULT" --cost "$COST" \
+  --rounds "$ROUNDS" --turns "$TURNS" ${NOTE:+--note "$NOTE"} ${SLEEP_DELAYED:+--delayed "$SLEEP_DELAYED"} \
+  ${ASIDE_N:+--set-aside "$ASIDE_N"})
+echo "$STATUS_OUT" | tee -a "$SUMMARY"
+STATUS_LINE=$(printf '%s\n' "$STATUS_OUT" | tail -1)
+# 途中で Mac が眠っていて、うまく終わらなかったときは、もう一度取るよう促す（slack.py status done がその行を出す）
+if printf '%s\n' "$STATUS_OUT" | grep -q '^スリープで取れなかった分があります'; then
+  notify "スリープで取れなかった分があります" "Mac が起きているときに、もう一度取ってください"
+else
+  case "$STATUS_LINE" in
+    *"状態: ok"*)      notify "取得できました" "${STATUS_LINE#状態: }" ;;
+    *"状態: ng"*)      notify "照合で合わないものがあります" "メニューバーのアプリで確かめてください" ;;
+    *"状態: stopped"*) notify "途中で止めました" "${NOTE}" ;;
+    *)                 notify "取得に失敗しました" "${NOTE}" ;;
+  esac
+fi
 echo "終わりました。まとめ: ${SUMMARY}"

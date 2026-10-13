@@ -15,6 +15,9 @@
 //   メニューの「Slack とチャンネル…」と設定から開き、取るチャンネルを足す・外す。Slack取得データ/チャンネル.json が無いときは開いたときに出す。
 //   準備の窓を開いている間と、最初の取得の前は、毎朝の自動取得を動かさない
 // - 取得に使うモデルは設定で選ぶ（台本に MODEL として渡す）
+// - Mac のスリープ（2026-10-13）: 眠っている間（点検のために一瞬起きたとき）でも、時刻が来たら毎朝の取得は始める（本人の希望）。
+//   取得の途中で眠ったときと、予定の時刻に眠っていたときは、記録に残して小窓・状況ページ・取得の記録に出す（月の印・灰色）。
+//   眠っていて取れなかったとき（途中で眠り、うまく終わらなかった）は、黄色で「スリープで取れなかった分があります」と出し、もう一度取るよう促す
 // - 確認用: SlackFetch --snapshot <フォルダ> で、各状態のメニューと状況ページを画像に書き出して終わる
 //   （-baseDir <取得の仕組みのフォルダ> を付けると、そのフォルダのデータで書き出す）
 // - 確認用: SlackFetch --test-base で、フォルダを追いかける仕組みを一時フォルダで試して終わる（本物の設定は触らない）
@@ -250,6 +253,17 @@ struct RunInfo: Codable {
     var round: Int?
     var todo: Int?
     var since: String?
+    var sleep: SleepInfo?
+    var delayed_from: String?   // 予定の時刻（9:00 など）に Mac がスリープしていたので、起きてから始めた
+    var set_aside: Int?         // この取得でよけた原本（空で返ってきたが、あとで取り直せたもの）の数
+    var sleep_missed: Bool?     // 途中で Mac が眠っていて、うまく終わらなかった（もう一度取るよう促す）
+}
+
+/// 取得の途中で Mac が眠っていた間（slack.py status done が Mac の電源の記録から書く。2026-10-13）
+struct SleepInfo: Codable {
+    var count: Int
+    var seconds: Int
+    var spans: [[String]]?   // [[眠った, 起きた]]（ISO の時刻）
 }
 
 struct ChannelInfo: Codable, Identifiable {
@@ -328,6 +342,9 @@ struct HistoryEntry: Codable, Identifiable {
     var note: String?
     var new: Int?
     var ng: Int?
+    var sleep: SleepInfo?
+    var delayed_from: String?
+    var sleep_missed: Bool?
     var id: String { (start ?? "") + "|" + (end ?? "") }
 }
 
@@ -425,6 +442,22 @@ final class Store: ObservableObject {
     private var refreshAgain = false   // 数え直しの途中で、もう一度保存された
     private var timer: Timer?
 
+    // ---- Mac のスリープ（2026-10-13） ----
+    // 眠っている Mac は、点検のために数十秒だけ起きる（DarkWake）ことがあり、このアプリの時計もそのとき動く。
+    // そこで取得を始めると、すぐまた眠って、眠っている間は止まり、途中の結果が空で返ることがある（2026-10-12）。
+    // それでも取得は始める（本人の希望）。眠っている中で始めたことは記録に残し、取れなかったら知らせて、もう一度取るよう促す。
+    // 点検で一瞬起きたときは、アプリに「起きた」の知らせが来ないので、眠ったままとして扱える
+    /// 眠りに入った時刻（本当に起きたら nil）
+    private var asleepSince: Date?
+    /// いちばん新しく眠っていた間（予定の時刻に眠っていたかを見る）
+    private var lastSleep: DateInterval?
+    /// 本当に起きた時刻（起きてすぐは通信がつながっていないことがあるので、20秒待ってから取る）
+    private var wokeAt: Date?
+    /// いまの取得の途中で眠っていた間（取得中の表示に使う。終わったあとは slack.py が 状態.json に書いたものを出す）
+    @Published var runSleeps: [DateInterval] = []
+    /// いまの取得は、予定の時刻に眠っていたので起きてから始めたもの（予定の時刻）
+    @Published var runDelayedFrom: String?
+
     init(live: Bool = true) {
         let d = UserDefaults.standard
         autoEnabled = d.object(forKey: "autoEnabled") as? Bool ?? true
@@ -457,13 +490,43 @@ final class Store: ObservableObject {
         }
         // 起動したとき・Mac が起きたときにも確かめる（9時に寝ていた日も、起きたら取る）
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.tick() }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
+        let nc = NSWorkspace.shared.notificationCenter
+        // 知らせは main の上で届くので、その場で（眠りに入る前に）書き留める
+        nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.willSleep() }
+        }
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.didWake() }
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 20_000_000_000)  // 起きてすぐは通信がつながっていないことがある
                 self?.tick()
             }
+        }
+        // 念のため: 画面が点いたなら、Mac は起きている（起きた知らせを取りこぼしても、取得が止まったままにならないように）
+        nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.didWake() }
+        }
+    }
+
+    private func willSleep() {
+        asleepSince = Date()
+        // アプリから動かした取得の途中なら、記録に残す（眠っている間は取得が止まる）
+        if process?.isRunning == true {
+            Store.appLogLine("Mac がスリープに入りました。スリープの間、取得は止まります")
+        }
+    }
+
+    private func didWake() {
+        guard let since = asleepSince else { return }
+        let woke = Date()
+        asleepSince = nil
+        lastSleep = DateInterval(start: since, end: max(since, woke))
+        wokeAt = woke
+        if running {
+            runSleeps.append(DateInterval(start: since, end: max(since, woke)))
+        }
+        if process?.isRunning == true {
+            Store.appLogLine("Mac がスリープから戻りました。取得の続きを動かします")
         }
     }
 
@@ -519,6 +582,11 @@ final class Store: ObservableObject {
         }
         running = (process?.isRunning ?? false) || lockIsAlive()
         configured = !Setup.savedChannels().isEmpty
+        if !running && forced == nil {
+            // 取得が終わったら、眠っていた間は slack.py が 状態.json に書いたもの（file.run.sleep）を出す
+            if !runSleeps.isEmpty { runSleeps = [] }
+            if runDelayedFrom != nil { runDelayedFrom = nil }
+        }
     }
 
     // ---- 取得の仕組みのフォルダ ----
@@ -684,6 +752,118 @@ final class Store: ObservableObject {
         return s
     }
 
+    // ---- Mac のスリープ（表示の言葉。画面案 2026-10-13 で決めたもの） ----
+
+    /// 「39分」「13時間7分」「1分未満」
+    static func spanText(_ seconds: Int) -> String {
+        let m = seconds / 60
+        if m < 1 { return "1分未満" }
+        return m >= 60 ? "\(m / 60)時間\(m % 60)分" : "\(m)分"
+    }
+
+    /// 「9:01〜9:40」（日をまたぐときは終わりに日付も）
+    static func rangeText(_ a: Date, _ b: Date) -> String {
+        let end = Calendar.current.isDate(a, inSameDayAs: b) ? Fmt.string(b, "H:mm") : Fmt.string(b, "M/d H:mm")
+        return "\(Fmt.string(a, "H:mm"))〜\(end)"
+    }
+
+    /// 眠っていた間。1回なら「9:01〜9:40・39分」、2回以上なら「2回・合わせて 52分」
+    static func sleepWhen(_ s: SleepInfo) -> String {
+        if s.count == 1, let p = s.spans?.first, p.count == 2, let a = Fmt.parseISO(p[0]), let b = Fmt.parseISO(p[1]) {
+            return "\(rangeText(a, b))・\(spanText(s.seconds))"
+        }
+        return "\(s.count)回・合わせて \(spanText(s.seconds))"
+    }
+
+    /// 眠っていた間を短く。1回なら「9:02〜12:05」、2回以上なら「2回・合わせて 52分」
+    static func sleepRange(_ s: SleepInfo) -> String {
+        if s.count == 1, let p = s.spans?.first, p.count == 2, let a = Fmt.parseISO(p[0]), let b = Fmt.parseISO(p[1]) {
+            return rangeText(a, b)
+        }
+        return "\(s.count)回・合わせて \(spanText(s.seconds))"
+    }
+
+    /// スリープで取れなかった（途中で眠っていて、うまく終わらなかった）。黄色で出し、もう一度取るよう促す（画面案の C）
+    var sleepMissed: Bool {
+        (display == .ng || display == .failed) && file.run?.sleep_missed == true && file.run?.sleep != nil
+    }
+
+    /// スリープで取れなかったときの説明（小窓のカードと、状況ページの見出しの下）
+    var sleepMissedText: String? {
+        guard sleepMissed, let s = file.run?.sleep else { return nil }
+        return "\(Fmt.relative(Fmt.parseISO(file.run?.start), now: now)) に始めた取得の途中で Mac がスリープしていて"
+            + "（\(Store.sleepRange(s))）、取れなかった分があります。Mac が起きているときに、もう一度取ってください"
+    }
+
+    /// 予定の時刻に眠っていたので、起きてから取った（小窓・状況ページの1行）
+    var delayedText: String? {
+        guard let d = file.run?.delayed_from else { return nil }
+        let start = Fmt.parseISO(file.run?.start).map { Fmt.string($0, "H:mm") } ?? "あと"
+        return "予定の \(d) は Mac がスリープしていたので、起きた \(start) に取りました"
+    }
+
+    /// 取得中に、アプリが見ていた眠り（取得中の小窓・状況ページ）
+    var runningSleepText: String? {
+        if let last = runSleeps.last {
+            let r = Store.rangeText(last.start, last.end)
+            return runSleeps.count == 1
+                ? "\(r) は Mac がスリープしていて、取得が止まっていました。いま続きを取っています"
+                : "途中で Mac が \(runSleeps.count)回スリープしていて、取得が止まっていました（最後は \(r)）。いま続きを取っています"
+        }
+        if let d = runDelayedFrom {
+            return "予定の \(d) は Mac がスリープしていたので、起きてから取っています"
+        }
+        return nil
+    }
+
+    /// 小窓の状態のカードに出す行（取得中は取得中の眠り、終わったあとは最後の取得の眠りと遅れ）
+    var sleepNotes: [String] {
+        if display == .running { return runningSleepText.map { [$0] } ?? [] }
+        if sleepMissed { return delayedText.map { [$0] } ?? [] }   // 眠りのことは、カードそのものに書いてある
+        var out: [String] = []
+        if let s = file.run?.sleep {
+            out.append("取得の途中で Mac がスリープしていました（\(Store.sleepWhen(s))）。"
+                       + (display == .ok ? "その間は止まっていましたが、全部取れています" : "その間は取得が止まっていました"))
+        }
+        if let d = delayedText { out.append(d) }
+        return out
+    }
+
+    /// 状況ページの見出しの下に出す行
+    var sleepNotesPage: [String] {
+        if display == .running { return runningSleepText.map { [$0] } ?? [] }
+        if sleepMissed { return delayedText.map { [$0] } ?? [] }   // 眠りのことは、見出しの下の知らせに書いてある
+        var out: [String] = []
+        if let s = file.run?.sleep {
+            let start = Fmt.parseISO(file.run?.start)
+            let day = start.map { d -> String in
+                let cal = Calendar.current
+                if cal.isDate(d, inSameDayAs: now) { return "今日" }
+                if let y = cal.date(byAdding: .day, value: -1, to: now), cal.isDate(d, inSameDayAs: y) { return "昨日" }
+                return Fmt.string(d, "M/d（E）")
+            } ?? "前回"
+            var t = "\(day)の取得の途中で Mac がスリープしていました（\(Store.sleepWhen(s))）。スリープの間は取得が止まっていました"
+            if display == .ok {
+                let n = file.run?.set_aside ?? 0
+                t += "が、" + (n > 0 ? "空で返ってきた \(n)件は取り直したので、" : "") + "抜けはありません"
+            }
+            out.append(t)
+        }
+        if let d = delayedText { out.append(d) }
+        return out
+    }
+
+    /// 取得の記録の「メモ」（前からのメモに、眠っていたことを足す）
+    static func historyMemo(_ e: HistoryEntry) -> String {
+        var parts: [String] = []
+        let missed = e.sleep_missed == true
+        if missed, let s = e.sleep { parts.append("スリープで取れなかった分あり（\(sleepWhen(s))）") }   // いちばん大事なので先に
+        if let n = e.note, !n.isEmpty { parts.append(n) }
+        if let d = e.delayed_from { parts.append("予定の \(d) は Mac がスリープ中。起きてから取った") }
+        if !missed, let s = e.sleep { parts.append("途中で Mac がスリープ（\(sleepWhen(s))）") }
+        return parts.joined(separator: "／")
+    }
+
     // ---- 毎朝の自動実行 ----
 
     func checkSchedule() {
@@ -693,7 +873,12 @@ final class Store: ObservableObject {
         let t = todaySchedule
         guard now >= t else { return }
         if let s = lastRunStart, s >= t { return }
-        runNow()
+        if let w = wokeAt, now.timeIntervalSince(w) < 20 { return }   // 起きてすぐは通信がつながっていないことがある
+        // 眠っている（点検のために一瞬起きたところ）ときも始める。そのことは記録に残す（runNow の asleep）。
+        // 予定の時刻に眠っていて、本当に起きてから始めるときは、そう書き残す（取得ログ・状況ページ・取得の記録に出る）
+        let asleep = asleepSince != nil
+        let slept = !asleep && (lastSleep.map { $0.start <= t && t <= $0.end } ?? false)
+        runNow(delayedFrom: slept ? timeText : nil, asleep: asleep)
     }
 
     // ---- 操作 ----
@@ -743,17 +928,28 @@ final class Store: ObservableObject {
     /// 「必ず後ろに足す」形（O_APPEND）で開く。取得と数え直し・チャンネル探しなど2つが同時に書いても、
     /// 開いたときの場所に書いて相手を上書きすることがない（2026-10-09 16:28 に、数え直しが取得の見出しを上書きした）
     static func appLog(_ title: String) -> FileHandle? {
+        guard let h = openAppLog() else { return nil }
+        h.write(Data("\n==== \(Fmt.string(Date(), "yyyy-MM-dd HH:mm:ss")) に開始（\(title)） ====\n".utf8))
+        return h
+    }
+
+    /// アプリから動かした記録.log に、見出しを付けずに1行足す（取得の途中のスリープ・眠っている中で取得を始めたときなど）
+    static func appLogLine(_ text: String) {
+        openAppLog()?.write(Data("（\(Fmt.string(Date(), "yyyy-MM-dd HH:mm:ss"))）\(text)\n".utf8))
+    }
+
+    private static func openAppLog() -> FileHandle? {
         guard !needsMigrate else { return nil }   // 前のデータが残っているうちは、新しい場所に書かない（引っ越し先が空でなくなる）
         let logURL = Paths.logs.appendingPathComponent("アプリから動かした記録.log")
         try? FileManager.default.createDirectory(at: Paths.logs, withIntermediateDirectories: true)
         let fd = open(logURL.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
         guard fd >= 0 else { return nil }
-        let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        h.write(Data("\n==== \(Fmt.string(Date(), "yyyy-MM-dd HH:mm:ss")) に開始（\(title)） ====\n".utf8))
-        return h
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
-    func runNow() {
+    /// delayedFrom: 予定の時刻（9:00 など）に Mac が眠っていたので、起きてから始めるとき（台本に SLEEP_DELAYED として渡す）
+    /// asleep: Mac が眠っている中（点検のために一瞬起きたところ）で始めるとき（記録に1行残す）
+    func runNow(delayedFrom: String? = nil, asleep: Bool = false) {
         guard !running, !migrating else { return }
         if launchedFromClaudeCode {
             message = Store.reopenMessage
@@ -785,7 +981,13 @@ final class Store: ObservableObject {
         var env = Store.scriptEnvironment()
         env["COST_CAP"] = String(costCap)
         env["NOTIFY"] = notify ? "1" : "0"
+        if let d = delayedFrom { env["SLEEP_DELAYED"] = d }
         p.environment = env
+        runSleeps = []
+        runDelayedFrom = delayedFrom
+        if asleep {
+            Store.appLogLine("Mac がスリープ中（点検のために一瞬起きたところ）ですが、予定の \(timeText) の取得を始めます。眠っている間は止まります")
+        }
         if let h = Store.appLog("取得係") {
             p.standardOutput = h
             p.standardError = h
@@ -1155,6 +1357,31 @@ struct Pill: View {
     }
 }
 
+/// 取得の記録の「スリープ」の印（取得の途中で Mac が眠っていた・予定の時刻に眠っていた）。問題ではないので灰色
+struct SleepBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "moon").font(.system(size: 9, weight: .bold))
+            Text("スリープ").font(.system(size: 11, weight: .bold))
+        }
+        .foregroundStyle(Color.ink2)
+        .padding(.horizontal, 8).padding(.vertical, 1)
+        .background(Capsule().fill(Color.surface2))
+    }
+}
+
+/// Mac のスリープの知らせ（月の印と文）。小窓の状態のカードと状況ページで使う。問題ではないので灰色
+struct SleepNote: View {
+    let text: String
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "moon").font(.system(size: 11)).foregroundStyle(Color.ink2)
+            Text(text).font(.system(size: 12)).foregroundStyle(Color.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 // MARK: - メニュー（メニューバーのアイコンを押すと出る）
 
 struct MenuIcon: View {
@@ -1180,7 +1407,8 @@ struct StatusCard: View {
         HStack(alignment: .top, spacing: 10) {
             ZStack {
                 Circle().fill(iconBG(s))
-                Image(systemName: iconName(s)).font(.system(size: 15, weight: .heavy)).foregroundStyle(s == .stale ? Color.ink : .white)
+                Image(systemName: iconName(s)).font(.system(size: 15, weight: .heavy))
+                    .foregroundStyle(s == .stale || store.sleepMissed ? Color.ink : .white)
             }
             .frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 4) {
@@ -1188,6 +1416,7 @@ struct StatusCard: View {
                 Text(desc(s)).font(.system(size: 12)).foregroundStyle(Color.ink2)
                     .fixedSize(horizontal: false, vertical: true)
                 extras(s)
+                ForEach(store.sleepNotes, id: \.self) { SleepNote(text: $0).padding(.top, 2) }
             }
             Spacer(minLength: 0)
         }
@@ -1195,7 +1424,9 @@ struct StatusCard: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(wash(s)))
     }
 
+    // スリープで取れなかったとき（画面案の C）は、照合 NG・失敗の代わりに、黄色に月の印で「もう一度取る」を促す
     private func iconName(_ s: DisplayState) -> String {
+        if store.sleepMissed { return "moon.fill" }
         switch s {
         case .ok: return "checkmark"
         case .running: return "arrow.clockwise"
@@ -1205,16 +1436,19 @@ struct StatusCard: View {
         }
     }
     private func iconBG(_ s: DisplayState) -> Color {
+        if store.sleepMissed { return .warnIcon }
         switch s {
         case .ok: return .okInk; case .running, .fresh: return .key; case .ng, .failed: return .ngInk; case .stale: return .warnIcon
         }
     }
     private func wash(_ s: DisplayState) -> Color {
+        if store.sleepMissed { return .warnWash }
         switch s {
         case .ok: return .okWash; case .running, .fresh: return .keyWash; case .ng, .failed: return .ngWash; case .stale: return .warnWash
         }
     }
     private func title(_ s: DisplayState) -> String {
+        if store.sleepMissed { return "スリープで取れなかった分があります" }
         switch s {
         case .ok: return "最新です"
         case .running: return "取得中…"
@@ -1227,6 +1461,7 @@ struct StatusCard: View {
         }
     }
     private func desc(_ s: DisplayState) -> String {
+        if let t = store.sleepMissedText { return t }
         let last = Fmt.relative(store.lastRunEnd, now: store.now)
         switch s {
         case .ok:
@@ -1248,6 +1483,17 @@ struct StatusCard: View {
         }
     }
     @ViewBuilder private func extras(_ s: DisplayState) -> some View {
+        if store.sleepMissed {
+            HStack(spacing: 8) {
+                DadsButton(title: "もう一度取る", small: true) { store.runNow() }
+                DadsButton(title: "取得ログを開く", kind: .quiet, small: true) { store.openLatestLog() }
+            }
+            .padding(.top, 6)
+        } else {
+            stateExtras(s)
+        }
+    }
+    @ViewBuilder private func stateExtras(_ s: DisplayState) -> some View {
         switch s {
         case .running:
             ProgressView().progressViewStyle(.linear).tint(.key).padding(.top, 4)
@@ -1533,6 +1779,7 @@ struct StatePill: View {
         .background(Capsule().fill(s.3))
     }
     private var spec: (String, String, Color, Color) {
+        if store.sleepMissed { return ("moon", "スリープで取れなかった", .warnInk, .warnWash) }
         switch store.display {
         case .ok: return ("checkmark.circle.fill", "最新・照合 OK", .okInk, .okWash)
         case .running:
@@ -1657,14 +1904,17 @@ struct HistoryCard: View {
                 ForEach(rows) { e in
                     GridRow {
                         Text(Fmt.relative(Fmt.parseISO(e.start), now: store.now)).font(.system(size: 12))
-                        Pill(result: e.result, ng: e.ng)
+                        HStack(spacing: 6) {
+                            Pill(result: e.result, ng: e.ng)
+                            if e.sleep != nil || e.delayed_from != nil { SleepBadge() }
+                        }
                         Text("+\(Fmt.number(e.new ?? 0))").font(.system(size: 12)).monospacedDigit()
                             .gridColumnAlignment(.trailing)
                         Text("\(e.rounds ?? 0)").font(.system(size: 12)).monospacedDigit().gridColumnAlignment(.trailing)
                         Text(String(format: "%.2f ドル", e.cost_usd ?? 0)).font(.system(size: 12)).monospacedDigit()
                             .gridColumnAlignment(.trailing)
-                        Text(e.note ?? "").font(.system(size: 11)).foregroundStyle(Color.ink3).lineLimit(1)
-                            .frame(maxWidth: 300, alignment: .leading)
+                        Text(Store.historyMemo(e)).font(.system(size: 11)).foregroundStyle(Color.ink3).lineLimit(1)
+                            .frame(maxWidth: 340, alignment: .leading)
                     }
                 }
             }
@@ -2164,6 +2414,7 @@ struct StatusContent: View {
                 ProgressView().progressViewStyle(.linear).tint(.key)
             }
             notice
+            sleepLine
             exceptionsLine
             tiles.zIndex(2)
             Card(title: "日ごとの新しい投稿（\(store.channels.count)チャンネル合計・直近14日）",
@@ -2255,6 +2506,14 @@ struct StatusContent: View {
                 Text(Store.migrateMessage).font(.system(size: 12)).foregroundStyle(Color.ink2).lineLimit(3)
                 Spacer()
             }
+        } else if let t = store.sleepMissedText {
+            // スリープで取れなかった（画面案の C）: 照合 NG・失敗の1行の代わりに、理由ともう一度取るボタン
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "moon").foregroundStyle(Color.warnInk)
+                Text(t).font(.system(size: 12)).foregroundStyle(Color.ink2).lineLimit(2)
+                Spacer()
+                DadsButton(title: "もう一度取る", small: true) { store.runNow() }
+            }
         } else {
             displayNotice
         }
@@ -2292,6 +2551,23 @@ struct StatusContent: View {
             }
         default:
             EmptyView()
+        }
+    }
+
+    // ---- Mac のスリープ（あるときだけ。問題ではないので灰色で） ----
+    @ViewBuilder private var sleepLine: some View {
+        let notes = store.sleepNotesPage
+        if !notes.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(notes, id: \.self) { t in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "moon").foregroundStyle(Color.ink2)
+                        Text(t).font(.system(size: 12)).foregroundStyle(Color.ink2)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
         }
     }
 
@@ -2508,6 +2784,43 @@ enum Snapshot {
         exc.file.check?.ng = []
         exc.file.check?.exceptions = ["既知の例外: \(ch0) 1785000000.000100 … \(Store.gaveUpReason)"]
         render(StatusContent().environmentObject(exc), to: "\(dir)/window_exception.png", width: 1000)
+        // Mac のスリープ（画面案 2026-10-13 の A・B と、取得中に起きたところ）
+        let cal = Calendar.current
+        let at = { (h: Int, m: Int) in cal.date(bySettingHour: h, minute: m, second: 0, of: Date()) ?? Date() }
+        let slept = Store(live: false)
+        prepare(slept, .ok)
+        slept.file.run?.start = Fmt.iso.string(from: at(9, 0))
+        slept.file.run?.end = Fmt.iso.string(from: at(9, 41))
+        slept.file.run?.sleep = SleepInfo(count: 1, seconds: 2340, spans: [[Fmt.iso.string(from: at(9, 1)), Fmt.iso.string(from: at(9, 40))]])
+        slept.file.run?.set_aside = 2
+        render(PopoverView().environmentObject(slept), to: "\(dir)/menu_ok_sleep.png", width: 380)
+        render(StatusContent().environmentObject(slept), to: "\(dir)/window_sleep.png", width: 1000)
+        let delayed = Store(live: false)
+        prepare(delayed, .ok)
+        delayed.file.run?.start = Fmt.iso.string(from: Date().addingTimeInterval(-180))
+        delayed.file.run?.delayed_from = "9:00"
+        render(PopoverView().environmentObject(delayed), to: "\(dir)/menu_ok_delayed.png", width: 380)
+        let wokeUp = Store(live: false)
+        prepare(wokeUp, .running)
+        wokeUp.runSleeps = [DateInterval(start: at(9, 1), end: at(9, 40))]
+        render(PopoverView().environmentObject(wokeUp), to: "\(dir)/menu_running_sleep.png", width: 380)
+        let asideTip = Store(live: false)
+        asideTip.previewTip = "check"
+        if let i = asideTip.file.check?.items?.firstIndex(where: { $0.name == "原本の形" }) {
+            asideTip.file.check?.items?[i].detail = "形の崩れた原本 0・ID の無い投稿 0\n空で返ってきたが、あとで取り直せた原本 2件は「よけた原本」のフォルダに移しました（NG にはしません）"
+        }
+        render(StatusContent().environmentObject(asideTip), to: "\(dir)/window_tip_check_aside.png", width: 1000)
+        // スリープで取れなかった（画面案の C）: 黄色に月の印で「もう一度取る」を促す
+        let missed = Store(live: false)
+        prepare(missed, .failed)
+        missed.file.state = "error"
+        missed.file.run?.start = Fmt.iso.string(from: at(9, 1))
+        missed.file.run?.end = Fmt.iso.string(from: at(12, 5))
+        missed.file.run?.note = "取得係が2周続けて1件も取れなかった（Slack の道具が使えなかった）"
+        missed.file.run?.sleep = SleepInfo(count: 1, seconds: 10980, spans: [[Fmt.iso.string(from: at(9, 2)), Fmt.iso.string(from: at(12, 5))]])
+        missed.file.run?.sleep_missed = true
+        render(PopoverView().environmentObject(missed), to: "\(dir)/menu_sleep_missed.png", width: 380)
+        render(StatusContent().environmentObject(missed), to: "\(dir)/window_sleep_missed.png", width: 1000)
         for tip in ["posts", "delta", "check", "cost"] {
             let s = Store(live: false)
             s.previewTip = tip
@@ -2518,6 +2831,16 @@ enum Snapshot {
         s.previewExpanded = true
         s.previewWeekBar = (s.channels.first?.week ?? []).dropLast(2).last.flatMap { Fmt.parseJST($0.date + " 12:00:00") }
             .map { Fmt.string($0, "M/d") }
+        // 取得の記録の「スリープ」の印とメモ（いちばん新しい取得は途中で眠った、その前は予定の時刻に眠っていた）
+        if s.history.count >= 3 {
+            s.history[0].sleep = SleepInfo(count: 1, seconds: 2340, spans: [[Fmt.iso.string(from: at(9, 1)), Fmt.iso.string(from: at(9, 40))]])
+            s.history[1].delayed_from = "9:00"
+            // スリープで取れなかった取得（画面案の C）
+            s.history[2].result = "error"
+            s.history[2].note = "取得係が2周続けて1件も取れなかった（Slack の道具が使えなかった）"
+            s.history[2].sleep = SleepInfo(count: 1, seconds: 10980, spans: [[Fmt.iso.string(from: at(9, 2)), Fmt.iso.string(from: at(12, 5))]])
+            s.history[2].sleep_missed = true
+        }
         render(StatusContent().environmentObject(s), to: "\(dir)/window_hover_chart_history.png", width: 1000)
         // 前の場所（取得の仕組みのフォルダの中の データ/）にデータがあるとき: 「引っ越す」を出す
         let savedBase = Paths.current
