@@ -11,6 +11,7 @@ Claude Code の作業記録（~/.claude/projects/.../*.jsonl）にそのまま�
   Slack取得データ/チャンネル/<名前>__<ID>/記録.jsonl      1投稿1行の記録
   Slack取得データ/チャンネル/<名前>__<ID>/原本/<年-月>/   Slack から返ってきたそのまま（投稿の月ごと）
   Slack取得データ/取得ログ/<年-月>/                       取得の周ごとの一覧・結果・まとめ
+  Slack取得データ/よけた原本/<名前>__<ID>/<年-月>/        空で返ってきたが、あとで取り直せた原本（消さずによける）
 
 使い方:
   python3 slack.py plan    <チャンネルID> <開始日> <終了日> [...]  まだ取っていない／取り直す呼び出しの一覧を出す
@@ -18,6 +19,7 @@ Claude Code の作業記録（~/.claude/projects/.../*.jsonl）にそのまま�
   python3 slack.py usage   作業記録.jsonl ...     その作業記録で使ったトークン量を数える
   python3 slack.py build                          原本から事実の記録（チャンネルごとの 記録.jsonl、1件1行）を作る
   python3 slack.py check                          照合（スレッドの返信数と、実際に取れた数が合うか）
+  python3 slack.py set-aside                      空で返ってきたが、あとで取り直せた原本を Slack取得データ/よけた原本/ に移す（消さない）
   python3 slack.py status  running|done|refresh   状態.json を書く（メニューバーのアプリが読む）
   python3 slack.py where                          データの場所を出す
   python3 slack.py migrate [前のフォルダ]         前の場所（取得の仕組みのフォルダの中の データ/ や、一番上の 原本/ など）から
@@ -45,6 +47,8 @@ DATA_NAME = "Slack取得データ"
 DATA = os.path.abspath(os.path.expanduser(os.environ.get("SLACK_FETCH_DATA") or os.path.join("~", DATA_NAME)))
 CH_ROOT = os.path.join(DATA, "チャンネル")          # 1チャンネル1フォルダ（<名前>__<ID>）。中に 記録.jsonl と 原本/<年-月>/
 OTHER_RAW = os.path.join(DATA, "その他", "原本")     # どのチャンネルの呼び出しか分からないもの
+# 空で返ってきたが、あとで同じものを取り直せた原本（Mac のスリープなどで）。消さずにここへよける。中は <チャンネルのフォルダ名>/<年-月>/
+ASIDE_ROOT = os.path.join(DATA, "よけた原本")
 LOG_ROOT = os.path.join(DATA, "取得ログ")           # 取得の周ごとの一覧・結果・まとめ（月ごと）
 # Claude Code の作業記録の置き場所（CLAUDE_CONFIG_DIR で設定の場所を変えている人は、そちらを見る）
 PROJECTS = os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"), "projects")
@@ -207,6 +211,14 @@ def raw_files(ch=None):
     return sorted(out)
 
 
+def aside_files():
+    """よけた原本（空で返ってきたが、あとで取り直せたもの）のファイルの一覧。記録・照合・計画には使わない"""
+    out = []
+    for dp, _, fn in os.walk(ASIDE_ROOT):
+        out += [os.path.join(dp, f) for f in fn if f.endswith(".json")]
+    return sorted(out)
+
+
 def plain_text(text):
     """Slack の結果は JSON で、改行は \\n、日本語は \\uXXXX の文字になっている。ほどいて、ふつうの文にする"""
     try:
@@ -227,7 +239,8 @@ def visible_to_ai(call):
 
 
 def cmd_extract(paths):
-    have = {os.path.basename(p) for p in raw_files()}   # 保存済み（どのチャンネルのフォルダにあっても）
+    # 保存済み（どのチャンネルのフォルダにあっても）。よけた原本も、もう一度保存し直さない
+    have = {os.path.basename(p) for p in raw_files() + aside_files()}
     saved = skipped = errors = seen = 0
     for path in paths or recent_logs():
         for call in find_calls(path):
@@ -417,12 +430,62 @@ def load_raw(ch=None):
     return calls
 
 
+def load_aside():
+    """よけた原本を読む（検査の道具が、頼んだ一覧と突き合わせるときに使う）"""
+    calls = []
+    for p in aside_files():
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        d["raw_file"] = os.path.basename(p)
+        calls.append(d)
+    calls.sort(key=lambda d: d.get("fetched_at") or "")
+    return calls
+
+
+def call_key(call):
+    """同じものを取りに行った呼び出しかを見分ける鍵（ページの続き＝cursor も含む）。
+    スレッドは、呼び方（oldest の付け方）によらず、親の投稿で見る"""
+    i = call.get("input") or {}
+    s = lambda v: None if v in (None, "") else str(v)
+    if call["tool"] == "slack_read_thread":
+        return (call["tool"], s(i.get("channel_id")), s(i.get("message_ts")), s(i.get("cursor")))
+    if call["tool"] == "slack_read_channel":
+        return (call["tool"], s(i.get("channel_id")), s(i.get("oldest")), s(i.get("latest")), s(i.get("cursor")))
+    return (call["tool"], s(i.get("filters")), s(i.get("query")), s(i.get("cursor")))
+
+
+def retried_broken(calls):
+    """形の崩れた原本のうち、あとで同じものを形どおりに取り直せたもの。
+    Mac のスリープや一時的なエラー（502 など）で、途中の呼び出しが空で返ることがある（2026-10-12 に、スリープ中の Mac で2件。次の周で取り直せていた）。
+    取り直せていれば、取れていない分は無い。スレッドは、頼んだスレッドそのものが返ったときだけ取り直せたとみなす"""
+    broken = [c for c in calls if not c.get("parse_ok")]
+    if not broken:
+        return []
+    want = {call_key(c) for c in broken}
+    good = {}   # 鍵 -> 形どおりに取れた、いちばん新しい時刻
+    for c in calls:
+        if not c.get("parse_ok") or c.get("is_error") or call_key(c) not in want:
+            continue
+        if c["tool"] == "slack_read_thread":
+            try:
+                parent, _, _ = parse_thread(json.loads(c["response_text"]).get("messages", ""))
+            except (ValueError, AttributeError):
+                continue
+            if parent and parent.get("ts") and parent["ts"] != c["input"].get("message_ts"):
+                continue   # 別のスレッドが返ったものは、取り直せたことにしない
+        k = call_key(c)
+        good[k] = max(good.get(k, ""), c.get("fetched_at") or "")
+    return [c for c in broken if good.get(call_key(c), "") > (c.get("fetched_at") or "")]
+
+
 SEARCH_TOOL = "slack_search_public_and_private"
 SEARCH_MSG_RE = re.compile(r"^Message_ts: (\S+)", re.M)
 THREAD_PARAM_RE = re.compile(r"thread_ts=([0-9.]+)")
 
 # 取り直しても別のスレッドが返った呼び出し（頼んだ親の ts ごと）。build_records が埋める
 WRONG_THREAD_CALLS = {}
+# 形は崩れていたが、あとで同じものを取り直せた原本（チャンネル, ファイル名）。NG にはしない。build_records が埋める
+RETRIED_RAW = []
 
 
 # スレッドの呼び方。頼んだのと別のスレッドが返ったら、次の取得で次の呼び方を試す（同じ呼び方は二度と頼まない）。
@@ -449,19 +512,6 @@ def thread_failed_forms(ch, pts):
     return {i for i in (form_index(pts, c) for c in WRONG_THREAD_CALLS.get((ch, pts), [])) if i is not None}
 
 
-# 形が崩れていた原本のうち、同じものを取り直して取れているもの（原本のファイル名）。build_records が埋める
-COVERED_BAD = []
-
-
-def call_target(call):
-    """呼び出しが何を取りに行ったか。同じチャンネルの同じ区切り・同じスレッドの同じページなら同じ
-    （スレッドの呼び方〈oldest〉の違いは同じとみなす）"""
-    i = call.get("input") or {}
-    if call["tool"] == "slack_read_thread":
-        return (call["tool"], i.get("channel_id"), i.get("message_ts"), i.get("cursor"))
-    return (call["tool"], i.get("channel_id"), i.get("oldest"), i.get("latest"), i.get("cursor"))
-
-
 def build_records(ch=None):
     """原本を全部読んで、(チャンネル, ts) ごとに1件にまとめる。新しく取ったものが勝つ。
     ch を渡すと、そのチャンネルの分だけ（計画を立てるときに、ほかのチャンネルを読まずに済む）。
@@ -475,17 +525,17 @@ def build_records(ch=None):
     calls = [c for c in load_raw(ch) if c["tool"] in ("slack_read_channel", "slack_read_thread")]
     records, problems = {}, []
     WRONG_THREAD_CALLS.clear()
-    COVERED_BAD.clear()
-    good_targets = {call_target(c) for c in calls if c.get("parse_ok")}
+    del RETRIED_RAW[:]
+    retried = {id(c) for c in retried_broken(calls)}
 
     # 1) スレッドの呼び出しを、実際に返ってきた親の投稿ごとに分ける
     #    （Slack の道具は oldest なしで開くと、ときどき別の投稿のスレッドを返すため）
     tcalls, reply_parent = {}, {}
     for call in calls:
         if not call.get("parse_ok"):
-            # 一時的なエラー（502 など）で形が崩れても、同じものを取り直して取れていれば問題にしない（取れていなければ NG）
-            if call_target(call) in good_targets:
-                COVERED_BAD.append(call["raw_file"])
+            # Mac のスリープや一時的なエラー（502 など）で形が崩れても、あとで同じものを取り直せていれば問題にしない（取れていなければ NG）
+            if id(call) in retried:
+                RETRIED_RAW.append((call_channel(call), call["raw_file"]))
             else:
                 problems.append("形の崩れた原本: %s" % call["raw_file"])
             continue
@@ -576,6 +626,8 @@ def cmd_build(_args):
                                                     os.path.relpath(path, DATA)))
     for p in problems:
         print("注意:", p)
+    for _, name in RETRIED_RAW:
+        print("注意: 空で返ってきたが、あとで取り直せた原本（NG にはしない）:", name)
     return 0
 
 
@@ -594,6 +646,8 @@ def run_check():
     use = listed_channels()
     shelved = set()
     shelved_files = set()
+    retried = list(RETRIED_RAW)
+    aside = [p for p in aside_files() if os.path.relpath(p, ASIDE_ROOT).split(os.sep)[0] != "その他"]
     if use is not None:
         shelved = {call_channel(c) for c in raw_all} - use - {None}
         records = {k: r for k, r in records.items() if r["channel"] in use}
@@ -602,14 +656,12 @@ def run_check():
         shelved_files = {c["raw_file"] for c in raw_all if call_channel(c) in shelved}
         problems = [p for p in problems if p.split(": ", 1)[-1] not in shelved_files]
         raw_all = [c for c in raw_all if call_channel(c) is None or call_channel(c) in use]
+        retried = [(c, n) for c, n in retried if c is None or c in use]
+        aside = [p for p in aside if os.path.relpath(p, ASIDE_ROOT).split(os.sep)[0].rsplit("__", 1)[-1] in use]
     lines, notes = [], []
     if shelved:
         notes.append("一覧から外したチャンネル %d 本の取ったデータは、表示と照合に使っていません"
                      "（消してはいません。付け直せば続きから取ります）" % len(shelved))
-    covered = [f for f in COVERED_BAD if f not in shelved_files]
-    if covered:
-        notes.append("形の崩れた原本 %d 件は、同じものを取り直して取れているので NG にしていません（一時的なエラーなど）"
-                     % len(covered))
     # Slack 側の食い違いで取りようがないと分かったものは 例外.json に理由付きで書く。
     # 黙って飛ばさず、照合のたびに「既知の例外」として表示する
     exc_path = EXC_PATH
@@ -690,6 +742,14 @@ def run_check():
         lines.append("NG ID の無い投稿: %d 件" % len(no_ts))
     for p in problems:
         lines.append("NG " + p)
+    if retried:
+        notes.append("空で返ってきたが、あとで取り直せた原本: %d 件（Mac のスリープや一時的なエラーなどで。NG にはしない。"
+                     "取得の終わりに「よけた原本」のフォルダへ移す）" % len(retried))
+    shape = "形の崩れた原本 %d・ID の無い投稿 %d" % (len(problems), len(no_ts))
+    if retried:
+        shape += "\n空で返ってきたが、あとで取り直せた原本 %d件は NG にしません（取得の終わりに「よけた原本」のフォルダへ移します）" % len(retried)
+    if aside:
+        shape += "\n空で返ってきたが、あとで取り直せた原本 %d件は「よけた原本」のフォルダに移しました（NG にはしません）" % len(aside)
     bad = (thread_ng + reverse_ng + len(gap_parts) + (1 if unread else 0) + (1 if hidden else 0)
            + (1 if no_ts else 0) + len(problems))
     items = [
@@ -702,8 +762,7 @@ def run_check():
          else "抜けあり: " + "・".join(gap_parts)},
         {"name": "読み分け", "ok": not unread and not hidden,
          "detail": "読めなかった見出しの行 %d・本文に残った返信数の行 %d" % (unread, len(hidden))},
-        {"name": "原本の形", "ok": not problems and not no_ts,
-         "detail": "形の崩れた原本 %d・ID の無い投稿 %d" % (len(problems), len(no_ts))},
+        {"name": "原本の形", "ok": not problems and not no_ts, "detail": shape},
         {"name": "既知の例外", "ok": True, "detail": "%d件（Slack 側の食い違いで取りようがないもの）" % exc_n},
     ]
     return lines, bad, len(parents), notes, items
@@ -716,6 +775,117 @@ def cmd_check(_args):
         print(line)
     print("照合: スレッド %d 本を確認、合わないもの %d" % (n, bad))
     return 1 if bad else 0
+
+
+def cmd_set_aside(_args):
+    """空で返ってきたが、あとで同じものを取り直せた原本を、Slack取得データ/よけた原本/<チャンネルのフォルダ名>/<年-月>/ に移す（消さない）。
+    取得係.sh が、取り残しが無くなったあと（記録を作る前）に動かす。移したものは、もう一度保存し直さない（extract が よけた原本 も見る）。
+    移したものがあるときだけ1行出す（取得係.sh がまとめに書き、件数を 状態.json に残す）"""
+    paths = {os.path.basename(p): p for p in raw_files()}
+    moved = 0
+    for call in retried_broken(load_raw()):
+        src = paths.get(call["raw_file"])
+        if not src:
+            continue
+        # Slack取得データ/チャンネル/<名前>__<ID>/原本/<年-月>/x.json → Slack取得データ/よけた原本/<名前>__<ID>/<年-月>/x.json
+        # Slack取得データ/その他/原本/<年-月>/x.json                → Slack取得データ/よけた原本/その他/<年-月>/x.json
+        parts = os.path.relpath(os.path.dirname(src), DATA).split(os.sep)
+        sub = os.path.join(parts[1] if parts[0] == "チャンネル" else parts[0], parts[-1])
+        dst = os.path.join(ASIDE_ROOT, sub, call["raw_file"])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.replace(src, dst)
+        moved += 1
+    if moved:
+        print("よけた原本: %d 件（空で返ってきたが、あとで同じものを取り直せたもの。「よけた原本」のフォルダに移した）" % moved)
+    return 0
+
+
+# ---- Mac のスリープ（取得の途中で眠っていた間） ----
+
+# 種類の欄は空白で幅をそろえたあとにタブが来る。「Wake Requests」（起こす予約）の行は拾わない
+PMSET_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4}) (Sleep|Wake|DarkWake) +\t")
+
+
+def iso_to_epoch(s):
+    """ISO の時刻（2026-10-13T00:00:01.000Z や 2026-10-13T09:01:42+09:00）を UNIX 秒に。読めなければ None"""
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def mac_sleeps(t0, t1):
+    """t0〜t1（UNIX 秒）のあいだに Mac が眠っていた区切りを [(眠った, 起きた), ...] で返す。Mac の電源の記録（pmset -g log）から読む。
+    眠っている間にも、点検のために数十秒だけ起きる（DarkWake）ことがある。その間は取得も動くが、2分以内に眠り直したものは、
+    続けて眠っていたことにする（2026-10-12 は、1時間おきに一瞬起きながら 9:02〜22:09 眠っていた → 1回）。
+    点検で起きている間に取得が始まって終わったとき（2026-10-11 9:08〜9:11）は、眠っていたことにしない。Mac でない・記録が読めないときは空"""
+    import datetime
+    import subprocess
+    try:
+        out = subprocess.run(["/usr/bin/pmset", "-g", "log"], capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    spans, since = [], None
+    for line in out.splitlines():
+        m = PMSET_RE.match(line)
+        if not m:
+            continue
+        try:
+            t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S %z").timestamp()
+        except ValueError:
+            continue
+        if t > t1:
+            break
+        if m.group(2) == "Sleep":
+            if since is None:
+                since = t
+        elif since is not None:   # Wake（本当に起きた）・DarkWake（点検で一瞬起きた）
+            spans.append((since, t))
+            since = None
+    if since is not None:
+        spans.append((since, t1))
+    merged = []
+    for a, b in spans:
+        a, b = max(a, t0), min(b, t1)
+        if b <= a:
+            continue
+        if merged and a - merged[-1][1] <= 120:   # 一瞬起きて、すぐ眠り直した
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def span_text(seconds):
+    """39分・13時間8分・1分未満"""
+    m = int(seconds // 60)
+    if m < 1:
+        return "1分未満"
+    return "%d時間%d分" % (m // 60, m % 60) if m >= 60 else "%d分" % m
+
+
+def sleep_info(spans):
+    """状態.json・取得の記録に残す形（アプリが読む）。眠っていなければ None"""
+    if not spans:
+        return None
+    import datetime
+    iso = lambda t: datetime.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+    return {"count": len(spans), "seconds": int(sum(b - a for a, b in spans)),
+            "spans": [[iso(a), iso(b)] for a, b in spans[:20]]}
+
+
+def sleep_when(spans):
+    """「9:01〜9:40（39分）」「2回・合わせて 52分（9:01〜9:40・10:02〜10:15）」。日をまたぐときは日付も付ける"""
+    def hm(t, ref):
+        lt, lr = time.localtime(t), time.localtime(ref)
+        same = lt.tm_yday == lr.tm_yday and lt.tm_year == lr.tm_year
+        return ("%d:%02d" if same else "%d/%d %%d:%%02d" % (lt.tm_mon, lt.tm_mday)) % (lt.tm_hour, lt.tm_min)
+    total = span_text(sum(b - a for a, b in spans))
+    parts = ["%s〜%s" % (hm(a, a), hm(b, a)) for a, b in spans[:3]]
+    if len(spans) == 1:
+        return "%s（%s）" % (parts[0], total)
+    return "%d回・合わせて %s（%s）" % (len(spans), total, "・".join(parts) + ("ほか" if len(spans) > 3 else ""))
 
 
 CURSOR_RE = re.compile(r"cursor:? `([^`]+)`")
@@ -1104,6 +1274,8 @@ def cmd_status(args):
     """状態.json を書く。
       status running --run-start 時刻 --round N --todo M      取得中
       status done --run-start 時刻 --result ok|ng|stopped|error --cost X --rounds N --turns T [--note 文]
+                  [--delayed 9:00（予定の時刻に Mac がスリープしていたので、起きてから始めた）] [--set-aside よけた原本の数]
+                  （取得の途中で Mac が眠っていた間は、Mac の電源の記録から調べて残す）
       status refresh                                          件数・照合だけ数え直す（取得の記録は増やさない）
       status interrupted --run-start 時刻 [--stamp 印]          途中で終わった取得を、取得の記録に残す
     done のときは記録から件数を数え、照合をして、取得の記録.jsonl にも1行足す。
@@ -1162,6 +1334,21 @@ def cmd_status(args):
            "cost_usd": float(opt(args, "--cost", 0)), "note": opt(args, "--note"),
            "new": sum(c["delta"] or 0 for c in out),
            "since": (st.get("run") or {}).get("end")}
+    # 取得の途中で Mac が眠っていた間（眠っている間は取得が止まる。アプリと取得の記録に出す）
+    t0 = iso_to_epoch(run["start"])
+    spans = mac_sleeps(t0, time.time()) if t0 else []
+    if spans:
+        run["sleep"] = sleep_info(spans)
+    # スリープで取れなかった: 途中で眠っていて、うまく終わらなかった（失敗・照合 NG・上限で止まった。止めるボタンは除く）。
+    # アプリが「もう一度取る」を促す（2026-10-13 本人の希望。スリープ中でも取得は始め、取れなかったら知らせる）
+    missed = bool(spans) and (result in ("ng", "error")
+                              or (result == "stopped" and not (run["note"] or "").startswith("止めるボタン")))
+    if missed:
+        run["sleep_missed"] = True
+    if opt(args, "--delayed"):   # 予定の時刻（9:00 など）に Mac がスリープしていたので、起きてから始めた
+        run["delayed_from"] = opt(args, "--delayed")
+    if int(opt(args, "--set-aside", 0) or 0):   # この取得でよけた原本の数
+        run["set_aside"] = int(opt(args, "--set-aside"))
     st.update(state=result, run=run, channels=out, daily=daily,
               check={"threads": n, "ng": [l for l in lines if l.startswith("NG")], "notes": notes, "items": items,
                      "exceptions": [l for l in lines if l.startswith("既知の例外")]})
@@ -1171,7 +1358,13 @@ def cmd_status(args):
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(dict(run, channels={c["tag"]: c["delta"] for c in out}, ng=len(st["check"]["ng"])),
                            ensure_ascii=False) + "\n")
-    print("状態: %s（新しく %d 件・照合 NG %d）" % (result, run["new"], len(st["check"]["ng"])))
+    # 取得係.sh は最後の行（状態: …）を通知に使う。スリープの行はその前に出す
+    if spans:
+        print("途中で Mac がスリープしていました: %s。スリープの間、取得は止まっていました" % sleep_when(spans))
+    if missed:   # 取得係.sh はこの行を見て、通知を「スリープで取れなかった」にする
+        print("スリープで取れなかった分があります。Mac が起きているときに、もう一度取ってください（アプリの「もう一度取る」）")
+    print("状態: %s（新しく %d 件・照合 NG %d%s）" % (result, run["new"], len(st["check"]["ng"]),
+          "・途中で Mac がスリープ " + span_text(run["sleep"]["seconds"]) if spans else ""))
     return 0
 
 
@@ -1656,6 +1849,7 @@ def cmd_oldest(args):
 def main(argv):
     cmds = {"extract": cmd_extract, "usage": cmd_usage, "build": cmd_build, "check": cmd_check,
             "plan": cmd_plan, "status": cmd_status, "migrate": cmd_migrate, "where": cmd_where, "guard": cmd_guard,
+            "set-aside": cmd_set_aside,
             "channels": cmd_channels, "oldest": cmd_oldest}
     if len(argv) < 2 or argv[1] not in cmds:
         print(__doc__)
