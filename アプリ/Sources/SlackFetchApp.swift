@@ -22,6 +22,7 @@
 //   （-baseDir <取得の仕組みのフォルダ> を付けると、そのフォルダのデータで書き出す）
 // - 確認用: SlackFetch --test-base で、フォルダを追いかける仕組みを一時フォルダで試して終わる（本物の設定は触らない）
 // - 確認用: SlackFetch --test-setup で、チャンネルを外す・保存・付け直すを一時フォルダで試して終わる（本物のデータは触らない）
+// - 確認用: SlackFetch --test-chart で、グラフのマウスの位置を聞く所を、日が無いグラフと日のあるグラフで試して終わる
 
 import AppKit
 import Charts
@@ -1799,6 +1800,13 @@ struct StatePill: View {
     }
 }
 
+/// マウスの位置の日（棒の吹き出しに使う）。日が 1 つも無いグラフでは聞かずに nil。
+/// Swift Charts は、日の並び（chartXScale の domain）を渡したグラフで並びが空のときに位置を聞くと落ちる
+/// （GitHub 取得で 2026-10-20 に落ちた）。このアプリは並びをデータから決めているので今は落ちないが、同じ形にそろえておく
+func hoveredDay(_ proxy: ChartProxy, x: CGFloat, days: Int) -> String? {
+    days > 0 ? proxy.value(atX: x, as: String.self) : nil
+}
+
 struct DailyChart: View {
     @EnvironmentObject var store: Store
     @State private var hovered: String?
@@ -1858,7 +1866,7 @@ struct DailyChart: View {
                 Rectangle().fill(.clear).contentShape(Rectangle())
                     .onContinuousHover { phase in
                         switch phase {
-                        case .active(let p): hovered = proxy.value(atX: p.x - plot.minX, as: String.self)
+                        case .active(let p): hovered = hoveredDay(proxy, x: p.x - plot.minX, days: data.count)
                         case .ended: hovered = nil
                         }
                     }
@@ -2000,7 +2008,7 @@ struct WeekChart: View {
                 Rectangle().fill(.clear).contentShape(Rectangle())
                     .onContinuousHover { phase in
                         switch phase {
-                        case .active(let p): hovered = proxy.value(atX: p.x - plot.minX, as: String.self)
+                        case .active(let p): hovered = hoveredDay(proxy, x: p.x - plot.minX, days: days.count)
                         case .ended: hovered = nil
                         }
                     }
@@ -3060,6 +3068,47 @@ enum BaseTest {
     }
 }
 
+// MARK: - 確かめ用: グラフのマウスの位置
+
+enum ChartTest {
+    /// 日が 1 つも無いグラフと、日のあるグラフで、マウスの位置を聞く所（hoveredDay）を試す。画面の外の窓で描くので、何も出ない。
+    /// 日の並びを渡したグラフで、並びが空のときに Swift Charts へ聞いてしまうと、この試しごと落ちる（GitHub 取得で 2026-10-20 に落ちた形）
+    @MainActor
+    static func run() -> Int32 {
+        _ = NSApplication.shared
+        var ng = 0
+        func check(_ name: String, _ ok: Bool) { print((ok ? "OK  " : "NG  ") + name); if !ok { ng += 1 } }
+        // 落ちる形（横軸は日の文字で、並びを決めて渡す）で試す。目盛りを隠して、1 日を幅 100 にする
+        func ask(_ days: [String], at xs: [CGFloat]) -> [String?]? {
+            var got: [String?]?
+            let chart = Chart {
+                ForEach(days, id: \.self) { d in BarMark(x: .value("日", d), y: .value("件数", 1)) }
+            }
+            .chartXScale(domain: days)
+            .chartXAxis(.hidden)
+            .chartYAxis(.hidden)
+            .chartOverlay { proxy in
+                Color.clear.onAppear { got = xs.map { hoveredDay(proxy, x: $0, days: days.count) } }
+            }
+            .frame(width: 300, height: 120)
+            let host = NSHostingView(rootView: chart)
+            let window = NSWindow(contentRect: NSRect(x: -30000, y: -30000, width: 300, height: 120), styleMask: [.borderless],
+                                  backing: .buffered, defer: false)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            return got
+        }
+        let none = ask([], at: [-10, 0, 150, 400])
+        check("日が 1 つも無いグラフ: 落ちずに、どこにマウスを乗せても「無し」", none.map { $0.allSatisfy { $0 == nil } } ?? false)
+        let three = ask(["10/1", "10/2", "10/3"], at: [50, 150, 250, -1000, 10000])
+        check("日が 3 つのグラフ: マウスの下の日を返す", three.map { Array($0.prefix(3)) == ["10/1", "10/2", "10/3"] } ?? false)
+        check("日が 3 つのグラフ: グラフの外は「無し」", three.map { $0.suffix(2).allSatisfy { $0 == nil } } ?? false)
+        print(ng == 0 ? "すべて期待どおりです" : "\(ng) 件おかしい")
+        return ng == 0 ? 0 : 1
+    }
+}
+
 // MARK: - アイコン（Dock と Finder 用）
 
 /// Apple の記号（SF Symbols）はアプリのアイコンに使えない決まりなので、図形だけで描く。
@@ -3121,7 +3170,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         store = Store(live: !CommandLine.arguments.contains("--snapshot") && !CommandLine.arguments.contains("--icon")
-                      && !CommandLine.arguments.contains("--test-base") && !CommandLine.arguments.contains("--test-setup"))
+                      && !CommandLine.arguments.contains("--test-base") && !CommandLine.arguments.contains("--test-setup")
+                      && !CommandLine.arguments.contains("--test-chart"))
         super.init()
         AppDelegate.shared = self
     }
@@ -3207,6 +3257,9 @@ struct SlackFetchApp: App {
         }
         if args.contains("--test-setup") {
             exit(SetupTest.run())
+        }
+        if args.contains("--test-chart") {
+            exit(ChartTest.run())
         }
         if let i = args.firstIndex(of: "--icon"), i + 1 < args.count {
             Snapshot.render(AppIconView(), to: args[i + 1], width: 1024, scale: 1)
