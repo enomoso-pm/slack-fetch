@@ -291,12 +291,13 @@ def cmd_usage(paths):
 
 # ---- 原本 → 事実の記録（1件1行） ----
 
-# 社外の人（Slack コネクトで共有したチャンネル）は「(W0123ABCDE, external: 相手の組織名)」のように、ID の後ろに所属が付く
-CH_HEAD_RE = re.compile(r"^=== Message from (.*?) (?:<[^>]*> )?\((\w+)(?:, external: (.*?))?\) at (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) JST ===\s*$")
+# 社外の人（Slack コネクトで共有したチャンネル）は「(W0123ABCDE, external: 相手の組織名)」のように、ID の後ろに所属が付く。
+# 名前の後ろの <…> は、ボットの印を決めるのに読む（中身は記録に入れない。設計書 5 章）
+CH_HEAD_RE = re.compile(r"^=== Message from (.*?) (?:<([^>]*)> )?\((\w+)(?:, external: (.*?))?\) at (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) JST ===\s*$")
 CHANNEL_RE = re.compile(r"^Channel: .*\((\w+)\)\s*$")
 THREAD_RE = re.compile(r"^Thread: (\d+) repl(?:y|ies)")
 REPLIES_HEAD_RE = re.compile(r"^=== THREAD REPLIES \((\d+) total\) ===")
-FROM_RE = re.compile(r"^From: (.*?) (?:<[^>]*> )?\((\w+)(?:, external: (.*))?\)\s*$")
+FROM_RE = re.compile(r"^From: (.*?) (?:<([^>]*)> )?\((\w+)(?:, external: (.*))?\)\s*$")
 # スレッドの結果では、返信と返信の間に「--- Reply 2 of 8 ---」の区切りの行が入る。本文に混ぜない
 THREAD_LINE_RE = re.compile(r"(^|\n)Thread: \d+ repl")
 REPLY_SEP_RE = re.compile(r"^--- Reply \d+ of \d+ ---\s*$")
@@ -308,6 +309,51 @@ FORWARD_PREFIX = "Forwarded message from"
 # 転送（Forwarded message from …: と、そのあとに続く転送された本文）、
 # リンクのプレビュー（App notification from …）、添付（Attachment: …）のまとまりが続くことがある
 ATTACH_RE = re.compile(r"^(App notification from |Attachment: )")
+
+
+def bot_mark(user_id, angle):
+    """ボットの印（設計書 5 章）。推測（名前など）では付けない。見出しの ID の頭が B なら True（Slack の公式の道具
+    Bolt for Python の説明に、ボットの ID は B で始まるとある）。見出しの <…> にメールアドレスがあれば False。
+    どちらでもなければ None（見出しだけでは決められない。ボットのユーザーの ID は U か W で始まることもある）"""
+    if user_id and user_id.startswith("B"):
+        return True
+    if angle and "@" in angle:
+        return False
+    return None
+
+
+# GitHub の PR・issue・discussion の URL（設計書 4 章）。後ろに /files や #issuecomment-… が付いてもよい
+GH_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/([A-Za-z0-9][\w.-]*/[\w.-]+)/(pull|issues|discussions)/([0-9]+)")
+GH_KIND = {"pull": "pr", "issues": "issue", "discussions": "discussion"}
+FENCE_LINE_RE = re.compile(r"^\s*```")
+
+
+def without_fences(text):
+    """コードの囲み（```）の中を外す（ログやコードの中の URL は、話のつながりとは限らない）"""
+    out, inside = [], False
+    for line in (text or "").split("\n"):
+        if FENCE_LINE_RE.match(line):
+            if line.count("```") % 2 == 1:   # 開く行・閉じる行（同じ行で開いて閉じるものは、行ごと見ない）
+                inside = not inside
+            continue
+        if not inside:
+            out.append(re.sub(r"```.*?```", " ", line))   # 行の途中の ```…``` も見ない
+    return "\n".join(out)
+
+
+def gh_links(rec):
+    """本文・リンクのプレビュー・転送から、GitHub の URL を拾う。「書いてあった」つながり（設計書 4 章）"""
+    out, seen = [], set()
+    for where, field in (("text", "text"), ("attachments", "attachments"), ("forwarded", "forwarded_from")):
+        for m in GH_URL_RE.finditer(without_fences(rec.get(field))):
+            n = int(m.group(3))
+            key = (m.group(1).lower(), m.group(2), n, where)
+            if n <= 0 or key in seen:
+                continue
+            seen.add(key)
+            out.append({"to": {"repo": m.group(1), "kind": GH_KIND[m.group(2)], "number": n},
+                        "strength": "written", "form": "url", "where": where})
+    return out
 
 
 def split_tail_meta(lines):
@@ -351,8 +397,8 @@ def parse_channel(text):
         if m:
             if cur:
                 out.append(cur)
-            cur = {"user_name": m.group(1), "user_id": m.group(2), "external_org": m.group(3),
-                   "time": m.group(4), "ts": None, "lines": []}
+            cur = {"user_name": m.group(1), "user_id": m.group(3), "external_org": m.group(4),
+                   "time": m.group(5), "ts": None, "bot": bot_mark(m.group(3), m.group(2)), "lines": []}
             continue
         if cur is None:
             continue
@@ -393,8 +439,8 @@ def parse_thread(text):
         if m:
             if cur:
                 blocks.append(cur)
-            cur = {"part": part, "user_name": m.group(1), "user_id": m.group(2), "external_org": m.group(3),
-                   "time": None, "ts": None, "lines": []}
+            cur = {"part": part, "user_name": m.group(1), "user_id": m.group(3), "external_org": m.group(4),
+                   "time": None, "ts": None, "bot": bot_mark(m.group(3), m.group(2)), "lines": []}
             continue
         if cur is None:
             continue
@@ -552,8 +598,13 @@ def build_records(ch=None):
         for r in replies:
             reply_parent[(ch, r["ts"])] = pts
 
-    # 2) 記録を作る。返信だと分かっているものは、チャンネル側に出ていても返信として扱う
-    in_channel = set()
+    # 2) 記録を作る。返信だと分かっているものは、チャンネル側に出ていても返信として扱う。
+    #    初めて知った時刻は、形どおりに読めた原本のうち、その投稿が入っているものの、いちばん早い取った時刻（設計書 3 章）
+    in_channel, first_seen = set(), {}
+
+    def seen(ch, ts, at):
+        if ts and at and (first_seen.get((ch, ts)) is None or at < first_seen[(ch, ts)]):
+            first_seen[(ch, ts)] = at
     for call in calls:
         if not call.get("parse_ok"):
             continue
@@ -562,6 +613,7 @@ def build_records(ch=None):
             ch = ch or call["input"].get("channel_id")
             for m in msgs:
                 in_channel.add((ch, m["ts"]))
+                seen(ch, m["ts"], call["fetched_at"])
                 tp = reply_parent.get((ch, m["ts"]))
                 m.update(channel=ch, thread_ts=tp, raw_file=call["raw_file"], fetched_at=call["fetched_at"])
                 if tp:
@@ -570,7 +622,10 @@ def build_records(ch=None):
         else:
             ch = call["input"].get("channel_id")
             parent, replies, declared, pts = call["_parsed"]
+            if parent:
+                seen(ch, parent.get("ts"), call["fetched_at"])
             for r in replies:
+                seen(ch, r.get("ts"), call["fetched_at"])
                 r = dict(r)
                 r.pop("part", None)
                 r.update(channel=ch, thread_ts=pts, reply_count=0, raw_file=call["raw_file"],
@@ -584,6 +639,8 @@ def build_records(ch=None):
                 records[(ch, parent["ts"])] = parent
     for key, rec in records.items():
         rec["also_in_channel"] = bool(rec.get("thread_ts")) and key in in_channel
+        rec["known_at"] = first_seen.get(key) or rec.get("fetched_at")
+        rec["links"] = gh_links(rec)
 
     # 3) スレッドごとに、いちばん新しい世代の数を出す
     threads = {}
@@ -605,7 +662,8 @@ def build_records(ch=None):
 
 
 FIELDS = ("channel", "ts", "thread_ts", "time", "user_id", "user_name", "external_org", "text",
-          "reply_count", "also_in_channel", "reactions", "files", "forwarded_from", "attachments", "raw_file", "fetched_at")
+          "reply_count", "also_in_channel", "reactions", "files", "forwarded_from", "attachments", "raw_file", "fetched_at",
+          "known_at", "links", "bot")
 
 
 def cmd_build(_args):
